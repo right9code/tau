@@ -1132,6 +1132,52 @@ export const SettingsSchema = lazySchema(() =>
             'Useful for enterprise administrators to add organization-specific context ' +
             '(e.g., "All plugins from our internal marketplace are vetted and approved.").',
         ),
+      /**
+       * User-defined custom LLM providers. Each entry declares an id, a
+       * display name, the wire protocol it speaks, a base URL, and an
+       * optional manual model catalog (used when the server's /v1/models
+       * endpoint is unavailable or untrustworthy).
+       *
+       * Security: base URLs are exfiltration vectors (same class as
+       * ANTHROPIC_BASE_URL / managedEnv.ts). This field is read ONLY when
+       * it appears in trusted sources (userSettings or policySettings); it is
+       * silently ignored in project / local settings files.
+       *
+       * API keys are NOT stored here — they follow the normal provider-key
+       * flow: ANTHROPIC_BASE_URL pattern env var `<ID>_API_KEY`, or the
+       * stored key written by `/login`.
+       */
+      customProviders: z
+        .array(
+          z.object({
+            /** Canonical identifier — used as the provider id in /provider, env lookup, etc. */
+            id: z.string().min(1).regex(/^[a-z0-9_-]+$/, 'id must be lowercase alphanumeric, hyphens, or underscores'),
+            /** Human-readable display name shown in the UI. */
+            name: z.string().min(1),
+            /**
+             * Wire protocol.
+             * - 'anthropic': server speaks Anthropic Messages API (routed via Anthropic SDK)
+             * - 'openai':    server speaks OpenAI Chat Completions (routed via openai-compat lane)
+             */
+            protocol: z.enum(['anthropic', 'openai']),
+            /** Full https:// (or http:// for local) base URL of the API, including /v1 if needed. */
+            baseUrl: z.string().url(),
+            /**
+             * Optional manual model catalog. Used as a fallback when the server's
+             * /v1/models endpoint is unavailable. If omitted, the lane fetches live.
+             */
+            models: z
+              .array(
+                z.object({
+                  id: z.string().min(1),
+                  name: z.string().optional(),
+                }),
+              )
+              .optional(),
+          }),
+        )
+        .optional()
+        .describe('User-defined custom LLM providers (trusted sources only).'),
     })
     .passthrough(),
 )

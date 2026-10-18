@@ -56,7 +56,14 @@ function readStore(options?: { fresh?: boolean }): KeyStore {
       _cacheTimestamp = now
       return _cachedStore
     }
-    _cachedStore = parsed as KeyStore
+    // Normalize missing maps: a hand-edited or older provider-keys.json may
+    // omit `keys` or `metadata`, and saveProviderKey/deleteProviderKey write
+    // into both — an undefined map would throw on assignment.
+    _cachedStore = {
+      version: 1,
+      keys: parsed.keys ?? {},
+      metadata: parsed.metadata ?? {},
+    }
     _cacheTimestamp = now
     return _cachedStore
   } catch {
