@@ -9,10 +9,12 @@ import {
 } from '../utils/auth.js'
 import {
   BROWSABLE_MODEL_PROVIDERS,
+  getBrowsableModelProviders,
   getProviderBrowseLabel,
+  isCustomBrowsableProvider,
   isVoiceConversationProvider,
   loadProviderModelSections,
-  type BrowsableModelProvider,
+  type AnyBrowsableModelProvider,
   type ModelVariantInfo,
   type ModelTag,
   type ProviderModelSection,
@@ -32,6 +34,8 @@ import {
   MAX_FAVORITE_MODELS,
   toggleFavoriteModel,
 } from '../utils/model/favoriteModels.js'
+import { getCustomProviderApiKey } from '../utils/customProviders.js'
+import type { APIProvider } from '../utils/model/providers.js'
 import {
   cycleDeepSeekEffort,
   getDeepSeekEffort,
@@ -91,10 +95,10 @@ import {
 import { hasStoredKey } from '../services/api/auth/api_key_manager.js'
 
 type Props = {
-  initialProvider: BrowsableModelProvider
-  onSelect: (provider: BrowsableModelProvider, modelId: string, effort?: OpenAIReasoningLevel) => void
+  initialProvider: AnyBrowsableModelProvider
+  onSelect: (provider: AnyBrowsableModelProvider, modelId: string, effort?: OpenAIReasoningLevel) => void
   onCancel: () => void
-  lockedProvider?: BrowsableModelProvider
+  lockedProvider?: AnyBrowsableModelProvider
   /** Some consumers select only a model, without an effort field to save. */
   allowOpenAIEffortSelection?: boolean
 }
@@ -134,9 +138,13 @@ const SECTION_ACCENT: Record<NonNullable<ProviderModelSection['accent']>, string
   toolless: 'yellow',
 }
 
-function getProviderStatusLabel(provider: BrowsableModelProvider): string {
+function getProviderStatusLabel(provider: AnyBrowsableModelProvider): string {
   if (isVoiceConversationProvider(provider)) {
     return hasStoredKey('openai_oauth') ? 'OpenAI connected' : 'OpenAI OAuth required'
+  }
+
+  if (isCustomBrowsableProvider(provider)) {
+    return getCustomProviderApiKey(provider) ? 'configured' : 'key optional'
   }
 
   if (provider === 'firstParty') {
@@ -145,7 +153,7 @@ function getProviderStatusLabel(provider: BrowsableModelProvider): string {
       : 'optional login'
   }
 
-  const authStatus = validateProviderAuth(provider)
+  const authStatus = validateProviderAuth(provider as APIProvider)
   if ((provider === 'ollama' || provider === 'lmstudio') && authStatus.method === 'none') return 'local'
   if (authStatus.valid) return 'configured'
   return provider === 'ollama' || provider === 'lmstudio' ? 'local' : 'login required'
@@ -227,14 +235,14 @@ function lastModelIndex(rows: readonly FlatRow[]): number {
 }
 
 function variantSelectionKey(
-  provider: BrowsableModelProvider,
+  provider: AnyBrowsableModelProvider,
   model: SectionedModelInfo,
 ): string {
   return `${provider}:${model.id}`
 }
 
 function getSelectedVariant(
-  provider: BrowsableModelProvider,
+  provider: AnyBrowsableModelProvider,
   model: SectionedModelInfo,
   variantSelections: Readonly<Record<string, number>>,
 ): ModelVariantInfo | null {
@@ -253,7 +261,7 @@ function getDefaultVariantIndex(model: SectionedModelInfo): number {
 }
 
 function getSelectedModelId(
-  provider: BrowsableModelProvider,
+  provider: AnyBrowsableModelProvider,
   model: SectionedModelInfo,
   variantSelections: Readonly<Record<string, number>>,
 ): string {
@@ -268,10 +276,13 @@ export function ProviderModelPicker({
   allowOpenAIEffortSelection = true,
 }: Props) {
   const [step, setStep] = useState<Step>(lockedProvider ? 'models' : 'provider')
+  // Built-ins plus the user's custom providers. Recomputed each render so a
+  // provider added via /provider in a sibling view surfaces on reopen.
+  const providerRows = useMemo(() => getBrowsableModelProviders(), [])
   const [selectedProviderIndex, setSelectedProviderIndex] = useState(() =>
     Math.max(
       0,
-      BROWSABLE_MODEL_PROVIDERS.indexOf(lockedProvider ?? initialProvider),
+      getBrowsableModelProviders().indexOf(lockedProvider ?? initialProvider),
     ),
   )
   const [selectedRowIndex, setSelectedRowIndex] = useState(0)
@@ -304,7 +315,7 @@ export function ProviderModelPicker({
 
   const selectedProvider =
     lockedProvider
-    ?? BROWSABLE_MODEL_PROVIDERS[selectedProviderIndex]
+    ?? providerRows[selectedProviderIndex]
     ?? initialProvider
 
   useEffect(() => {
@@ -413,14 +424,14 @@ export function ProviderModelPicker({
     if (step === 'provider') {
       if (key.upArrow) {
         setSelectedProviderIndex(index =>
-          index > 0 ? index - 1 : BROWSABLE_MODEL_PROVIDERS.length - 1,
+          index > 0 ? index - 1 : providerRows.length - 1,
         )
         return
       }
 
       if (key.downArrow) {
         setSelectedProviderIndex(index =>
-          index < BROWSABLE_MODEL_PROVIDERS.length - 1 ? index + 1 : 0,
+          index < providerRows.length - 1 ? index + 1 : 0,
         )
         return
       }
@@ -459,6 +470,11 @@ export function ProviderModelPicker({
         return
       }
 
+      if (isCustomBrowsableProvider(selectedProvider)) {
+        setFavoriteNotice('Custom-provider models cannot be favorited')
+        return
+      }
+
       const modelId = getSelectedModelId(
         selectedProvider,
         row.model,
@@ -470,7 +486,7 @@ export function ProviderModelPicker({
         variantSelections,
       )
       const result = toggleFavoriteModel(
-        selectedProvider,
+        selectedProvider as APIProvider,
         modelId,
         variant?.name ?? row.model.name ?? row.model.id,
       )
@@ -695,7 +711,7 @@ export function ProviderModelPicker({
         </Text>
 
         <Box marginTop={1} flexDirection="column">
-          {BROWSABLE_MODEL_PROVIDERS.map((provider, index) => {
+          {providerRows.map((provider, index) => {
             const isSelected = index === selectedProviderIndex
             const status = getProviderStatusLabel(provider)
 
@@ -796,8 +812,9 @@ export function ProviderModelPicker({
                   : model.id
               const isStarred =
                 !isVoiceConversationProvider(selectedProvider)
+                && !isCustomBrowsableProvider(selectedProvider)
                 && isFavoriteModel(
-                  selectedProvider,
+                  selectedProvider as APIProvider,
                   getSelectedModelId(selectedProvider, model, variantSelections),
                 )
               const isReasoning = allowOpenAIEffortSelection && selectedProvider === 'openai' && modelSupportsReasoning(model.id)

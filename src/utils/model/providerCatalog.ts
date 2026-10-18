@@ -18,6 +18,12 @@ import {
   getAPIProvider,
   PROVIDER_DISPLAY_NAMES,
 } from './providers.js'
+import {
+  getCustomProviders,
+  getCustomProvider,
+  getCustomProviderApiKey,
+  getCustomProviderBaseUrl,
+} from '../customProviders.js'
 import { recordProviderModelContextWindows } from './contextWindows.js'
 import { getStoredCatalogAgeMs } from './contextWindowStore.js'
 import { logForDebugging } from '../debug.js'
@@ -59,15 +65,44 @@ import {
 /** Longest the picker waits for OpenCode's ladders when none are on disk. */
 const OPENCODE_MODELS_DEV_WAIT_MS = 8_000
 
+/**
+ * A browsable provider is either a built-in/selectable provider id or the
+ * synthetic voice-conversation entry. User-defined custom provider ids flow
+ * through the same path but are typed as the widened
+ * {@link AnyBrowsableModelProvider} at the dynamic boundaries, so the narrow
+ * union keeps its exhaustiveness for the built-in tables.
+ */
 export type BrowsableModelProvider =
   | APIProvider
   | typeof VOICE_CONVERSATION_PROVIDER
 
+/** The browsable provider union widened to include custom provider ids. */
+export type AnyBrowsableModelProvider = BrowsableModelProvider | string
+
 export const BROWSABLE_MODEL_PROVIDERS: readonly BrowsableModelProvider[] =
   [...SELECTABLE_PROVIDERS, VOICE_CONVERSATION_PROVIDER]
 
+/**
+ * The full browsable provider list for this session: the static built-ins
+ * followed by the user's custom providers. The picker reads this instead of
+ * BROWSABLE_MODEL_PROVIDERS so custom providers appear (at the bottom) and
+ * stay selectable. Custom ids are appended in declaration order.
+ */
+export function getBrowsableModelProviders(): AnyBrowsableModelProvider[] {
+  return [
+    ...BROWSABLE_MODEL_PROVIDERS,
+    ...getCustomProviders().map(provider => provider.id),
+  ]
+}
+
+/** True for a user-defined custom provider id (not a built-in). */
+export function isCustomBrowsableProvider(provider: string): boolean {
+  return !BROWSABLE_MODEL_PROVIDERS.includes(provider as BrowsableModelProvider)
+    && getCustomProvider(provider) !== null
+}
+
 export function isVoiceConversationProvider(
-  provider: BrowsableModelProvider,
+  provider: AnyBrowsableModelProvider,
 ): provider is typeof VOICE_CONVERSATION_PROVIDER {
   return provider === VOICE_CONVERSATION_PROVIDER
 }
@@ -75,7 +110,7 @@ export function isVoiceConversationProvider(
 export function getDefaultBrowsableProvider(
   preferredProvider: APIProvider,
 ): BrowsableModelProvider {
-  if (BROWSABLE_MODEL_PROVIDERS.includes(preferredProvider)) {
+  if (getBrowsableModelProviders().includes(preferredProvider)) {
     return preferredProvider
   }
 
@@ -88,7 +123,7 @@ export function getDefaultBrowsableProvider(
 
 function normalizeProviderQueryToken(
   token: string,
-): BrowsableModelProvider | null {
+): AnyBrowsableModelProvider | null {
   const normalized = token.trim().toLowerCase()
   const alias: Record<string, BrowsableModelProvider> = {
     anthropic: 'firstParty',
@@ -163,7 +198,7 @@ function normalizeProviderQueryToken(
     return alias[normalized]
   }
   return (
-    BROWSABLE_MODEL_PROVIDERS.find(
+    getBrowsableModelProviders().find(
       provider => provider.toLowerCase() === normalized,
     ) ?? null
   )
@@ -171,8 +206,8 @@ function normalizeProviderQueryToken(
 
 export function parseProviderModelQuery(
   rawArgs: string,
-  fallbackProvider: BrowsableModelProvider,
-): { provider: BrowsableModelProvider; query: string } {
+  fallbackProvider: AnyBrowsableModelProvider,
+): { provider: AnyBrowsableModelProvider; query: string } {
   const args = rawArgs.trim()
   if (!args) {
     return { provider: fallbackProvider, query: '' }
@@ -249,7 +284,7 @@ export async function refreshProviderContextWindows(): Promise<void> {
 }
 
 export async function loadProviderModels(
-  provider: BrowsableModelProvider,
+  provider: AnyBrowsableModelProvider,
 ): Promise<ModelInfo[]> {
   if (isVoiceConversationProvider(provider)) {
     return LIVE_VOICE_OPTIONS.map(voice => ({
@@ -271,10 +306,21 @@ export async function loadProviderModels(
     return models
   }
 
-  await resolveProviderAuth(provider)
+  // Custom providers are not resolved through the built-in provider registry
+  // (no `getProvider(id)` shim, no auth table). Merge the declared catalog
+  // with whatever the server advertises, so an unlisted endpoint still shows
+  // at least its declared rows.
+  if (isCustomBrowsableProvider(provider)) {
+    return loadCustomProviderModels(provider)
+  }
+
+  // Past the custom guard every remaining id is a built-in provider.
+  const builtin = provider as APIProvider
+
+  await resolveProviderAuth(builtin)
 
   const [upstreamModels] = await Promise.all([
-    getProvider(provider).listModels(),
+    getProvider(builtin).listModels(),
     // OpenCode's thinking chips are drawn from the ladder models.dev states
     // per row. Only a machine with no copy yet waits, alongside a fetch the
     // user is already waiting on; a due refresh otherwise runs behind it.
@@ -282,20 +328,20 @@ export async function loadProviderModels(
       ? waitForOpencodeModelsDev(OPENCODE_MODELS_DEV_WAIT_MS)
       : undefined,
   ])
-  const models = provider === 'opencode' || provider === 'opencodego'
+  const models = builtin === 'opencode' || builtin === 'opencodego'
     ? upstreamModels.map(model => {
-        const contextWindow = getOpencodeContextWindow(provider, model.id)
+        const contextWindow = getOpencodeContextWindow(builtin, model.id)
         return contextWindow === undefined ? model : { ...model, contextWindow }
       })
     : upstreamModels
-  if (provider === 'openrouter') {
+  if (builtin === 'openrouter') {
     // OpenRouter states each row's reasoning ladder in its own catalogue, and
     // the picker draws those chips synchronously. Warming here — alongside a
     // fetch the user is already waiting on — is what makes the ladder correct
     // on the FIRST /models visit rather than after a keypress.
     await warmOpenRouterReasoningCatalog()
   }
-  recordProviderModelContextWindows(provider, models)
+  recordProviderModelContextWindows(builtin, models)
   if ([
     'cursor',
     'cline',
@@ -308,7 +354,7 @@ export async function loadProviderModels(
     'lxd',
     'mimo',
     'alibaba',
-  ].includes(provider)) {
+  ].includes(builtin)) {
     // Cursor's native picker order is provider-owned and should not be
     // alphabetized away; the ids intentionally mirror Cursor's own model surface.
     // Cline, GLM, Moonshot, MiniMax, Antigravity, LXD and Alibaba also return
@@ -317,12 +363,91 @@ export async function loadProviderModels(
     // newest described model and trails with ids models.dev has not described).
     return models
   }
-  if (provider === 'openrouter' || provider === 'nim' || provider === 'modelrouter' || provider === 'vercel' || provider === 'requesty' || provider === 'opencode' || provider === 'commandcode') {
+  if (builtin === 'openrouter' || builtin === 'nim' || builtin === 'modelrouter' || builtin === 'vercel' || builtin === 'requesty' || builtin === 'opencode' || builtin === 'commandcode') {
     return sortProviderModels(
-      models.map(model => enrichUpstreamProviderModel(provider, model)),
+      models.map(model => enrichUpstreamProviderModel(builtin, model)),
     )
   }
   return sortProviderModels(models)
+}
+
+/** How long a custom provider's /v1/models fetch may take before giving up. */
+const CUSTOM_PROVIDER_MODELS_TIMEOUT_MS = 4_000
+
+/**
+ * Models for a user-defined custom provider: the declared `models` array
+ * merged with what the endpoint advertises. Declared rows win on id collision
+ * so a user can pin a friendly display name over an opaque upstream id.
+ *
+ * A keyless provider (no env var, no stored key, no auth needed) still lists
+ * its declared models; a fetch failure is non-fatal and simply yields the
+ * declared set (or a single placeholder row) so the picker never shows an
+ * empty screen for a provider the user just created.
+ */
+async function loadCustomProviderModels(
+  provider: string,
+): Promise<ModelInfo[]> {
+  const custom = getCustomProvider(provider)
+  const declared: ModelInfo[] = (custom?.models ?? []).map(model => ({
+    id: model.id,
+    name: model.name ?? model.id,
+  }))
+
+  const fetched = await fetchCustomProviderModels(provider)
+
+  const merged = new Map<string, ModelInfo>()
+  for (const model of fetched) merged.set(model.id, model)
+  // Declared rows override fetched ones (friendlier names, pinned ids).
+  for (const model of declared) merged.set(model.id, model)
+
+  const models = Array.from(merged.values())
+  if (models.length === 0) {
+    return [{ id: 'default', name: 'default' }]
+  }
+  return models
+}
+
+/**
+ * Best-effort GET of `<baseUrl>/v1/models` for an OpenAI-compatible custom
+ * provider. Returns [] on any error (network, timeout, non-JSON, bad shape),
+ * so callers fall back to the declared catalog.
+ */
+async function fetchCustomProviderModels(
+  provider: string,
+): Promise<ModelInfo[]> {
+  const baseUrl = getCustomProviderBaseUrl(provider)
+  if (!baseUrl) return []
+
+  // Accept both `https://host` and `https://host/v1` in the stored base URL.
+  const root = baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '')
+  const url = `${root}/v1/models`
+
+  const key = getCustomProviderApiKey(provider)
+  const headers: Record<string, string> = { accept: 'application/json' }
+  if (key) headers.authorization = `Bearer ${key}`
+
+  try {
+    const response = await fetch(url, {
+      headers,
+      signal: AbortSignal.timeout(CUSTOM_PROVIDER_MODELS_TIMEOUT_MS),
+    })
+    if (!response.ok) return []
+    const payload = (await response.json()) as
+      | { data?: Array<{ id?: unknown; name?: unknown }> }
+      | Array<{ id?: unknown; name?: unknown }>
+    const rows = Array.isArray(payload) ? payload : payload.data
+    if (!Array.isArray(rows)) return []
+    return rows
+      .filter((row): row is { id: string; name?: unknown } =>
+        !!row && typeof row.id === 'string' && row.id.length > 0,
+      )
+      .map(row => ({
+        id: row.id,
+        name: typeof row.name === 'string' && row.name ? row.name : row.id,
+      }))
+  } catch {
+    return []
+  }
 }
 
 /**
@@ -474,7 +599,7 @@ function isAnthropicEffortLevel(value: string): value is EffortLevel {
 }
 
 export function resolveProviderModelSelection(
-  provider: BrowsableModelProvider,
+  provider: AnyBrowsableModelProvider,
   selectedModelId: string,
 ): ProviderModelSelection {
   if (isClinePassProvider(provider)) {
@@ -514,7 +639,7 @@ export function resolveProviderModelSelection(
  * models from the rest.
  */
 export async function loadProviderModelSections(
-  provider: BrowsableModelProvider,
+  provider: AnyBrowsableModelProvider,
   options: { currentModel?: string } = {},
 ): Promise<ProviderModelSection[]> {
   if (isVoiceConversationProvider(provider)) {
@@ -537,13 +662,29 @@ export async function loadProviderModelSections(
     return buildAnthropicSections()
   }
 
-  if (provider === 'ollama') {
+  // Custom providers get one flat section of their declared + fetched models;
+  // no built-in sectioning (Ollama/OpenRouter/Cursor) applies to them.
+  if (isCustomBrowsableProvider(provider)) {
+    const models = await loadCustomProviderModels(provider)
+    return [
+      {
+        id: 'all',
+        title: 'Models',
+        models: models.map(toProviderSectionedModel),
+      },
+    ]
+  }
+
+  // Past the custom guard every remaining id is a built-in provider.
+  const builtin = provider as APIProvider
+
+  if (builtin === 'ollama') {
     const catalog = await getOllamaCatalog()
     return buildOllamaSections(catalog)
   }
 
-  if (provider === 'lmstudio') {
-    const models = await loadProviderModels(provider)
+  if (builtin === 'lmstudio') {
+    const models = await loadProviderModels(builtin)
     return [
       {
         id: 'local',
@@ -557,23 +698,23 @@ export async function loadProviderModelSections(
     ]
   }
 
-  if (provider === 'cursor') {
-    await resolveProviderAuth(provider)
+  if (builtin === 'cursor') {
+    await resolveProviderAuth(builtin)
     return buildCursorSections()
   }
 
-  const models = await loadProviderModels(provider)
+  const models = await loadProviderModels(builtin)
 
-  if (isClinePassProvider(provider)) {
+  if (isClinePassProvider(builtin)) {
     return buildClinePassSections(models)
   }
 
-  if (provider === 'openrouter' || provider === 'nim' || provider === 'modelrouter' || provider === 'vercel' || provider === 'requesty' || provider === 'opencode' || provider === 'commandcode') {
-    return buildUpstreamProviderSections(provider, models)
+  if (builtin === 'openrouter' || builtin === 'nim' || builtin === 'modelrouter' || builtin === 'vercel' || builtin === 'requesty' || builtin === 'opencode' || builtin === 'commandcode') {
+    return buildUpstreamProviderSections(builtin, models)
   }
 
   // For OpenAI: split into Codex (reasoning) and other models.
-  if (provider === 'openai') {
+  if (builtin === 'openai') {
     const codex: SectionedModelInfo[] = []
     const other: SectionedModelInfo[] = []
     for (const m of models) {
@@ -603,8 +744,8 @@ export async function loadProviderModelSections(
   return [
     {
       id: 'all',
-      title: `${getProviderBrowseLabel(provider)} models`,
-      models: provider === 'antigravity'
+      title: `${getProviderBrowseLabel(builtin)} models`,
+      models: builtin === 'antigravity'
         ? toAntigravitySectionedModels(models, options.currentModel)
         : models.map(toProviderSectionedModel),
     },
@@ -893,11 +1034,15 @@ export function filterProviderModels(
   })
 }
 
-export function getProviderBrowseLabel(provider: BrowsableModelProvider): string {
+export function getProviderBrowseLabel(provider: AnyBrowsableModelProvider): string {
   if (isVoiceConversationProvider(provider)) {
     return VOICE_CONVERSATION_LABEL
   }
-  return PROVIDER_DISPLAY_NAMES[provider]
+  const custom = getCustomProvider(provider)
+  if (custom) {
+    return custom.name
+  }
+  return PROVIDER_DISPLAY_NAMES[provider as APIProvider] ?? provider
 }
 
 function buildUpstreamProviderSections(

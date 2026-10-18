@@ -13,18 +13,19 @@ import type { AppState } from '../../state/AppStateStore.js'
 import { stripSignatureBlocks } from '../../utils/messages.js'
 import {
   getAPIProvider,
-  PROVIDER_DISPLAY_NAMES,
   setActiveProvider,
 } from '../../utils/model/providers.js'
+import type { APIProvider } from '../../utils/model/providers.js'
 import {
-  BROWSABLE_MODEL_PROVIDERS,
   filterProviderModels,
+  getBrowsableModelProviders,
   getDefaultBrowsableProvider,
   getProviderBrowseLabel,
   isVoiceConversationProvider,
   loadProviderModels,
   parseProviderModelQuery,
   resolveProviderModelSelection,
+  type AnyBrowsableModelProvider,
   type BrowsableModelProvider,
 } from '../../utils/model/providerCatalog.js'
 import { getProviderModelDisplayName } from '../../utils/model/display.js'
@@ -67,7 +68,7 @@ function ModelsPickerWrapper({
   const currentModel = useAppState((s: AppState) => s.mainLoopModel)
   const initialProvider = lockedProvider ?? getDefaultBrowsableProvider(currentProvider)
 
-  function handleSelect(provider: BrowsableModelProvider, modelId: string, openaiEffort?: OpenAIReasoningLevel) {
+  function handleSelect(provider: AnyBrowsableModelProvider, modelId: string, openaiEffort?: OpenAIReasoningLevel) {
     if (isVoiceConversationProvider(provider)) {
       const result = setSelectedLiveVoice(modelId)
       if (result.error) {
@@ -93,9 +94,11 @@ function ModelsPickerWrapper({
     const providerChanged = currentProvider !== provider
     const modelChanged = currentModel !== selection.modelId
     if (providerChanged) {
-      setActiveProvider(provider)
+      // Custom provider ids are stored verbatim; the APIProvider type is only
+      // the built-in union, so a custom id passes through this cast unchanged.
+      setActiveProvider(provider as APIProvider)
     }
-    if (isConcreteOpenAIGptModelForProvider(selection.modelId, provider)) {
+    if (isConcreteOpenAIGptModelForProvider(selection.modelId, provider as APIProvider)) {
       setMainLoopModelOverride(selection.modelId)
     }
 
@@ -127,11 +130,11 @@ function ModelsPickerWrapper({
     }
 
     const providerNote = currentProvider !== provider
-      ? ` (switched to ${chalk.bold(PROVIDER_DISPLAY_NAMES[provider])})`
+      ? ` (switched to ${chalk.bold(getProviderBrowseLabel(provider))})`
       : ''
 
     const displayModel =
-      getProviderModelDisplayName(provider, selection.modelId)
+      getProviderModelDisplayName(provider as APIProvider, selection.modelId)
       ?? selection.modelId
     const effortNote = selection.effort
       ? ` with ${chalk.bold(selection.effort)} effort`
@@ -209,7 +212,7 @@ async function showSearchResults(
 function showHelp(
   onDone: (result?: string, options?: { display?: CommandResultDisplay }) => void,
 ) {
-  const providerList = BROWSABLE_MODEL_PROVIDERS.map(
+  const providerList = getBrowsableModelProviders().map(
     provider => `  ${chalk.bold(getProviderBrowseLabel(provider))}`,
   ).join('\n')
 

@@ -61,6 +61,20 @@ import {
   formatE2BSecurityBadge,
   hasE2BSecurityAuth,
 } from '../../utils/safetest/e2bSecurity.js'
+import {
+  addUserCustomProvider,
+  getCustomProvider,
+  getCustomProviderApiKey,
+  getCustomProviders,
+  getUserCustomProviders,
+  isCustomProvider,
+  isPolicyOnlyCustomProvider,
+  isReservedProviderId,
+  removeUserCustomProvider,
+  resetCustomProviderCache,
+  updateUserCustomProvider,
+  type CustomProvider,
+} from '../../utils/customProviders.js'
 
 // ─── Config ──────────────────────────────────────────────────────
 
@@ -124,13 +138,37 @@ const MANAGEABLE_PROVIDER_ROWS = [
   E2B_SECURITY_PROVIDER,
 ] as const
 
-type ManageableProvider = (typeof MANAGEABLE_PROVIDER_ROWS)[number]
+type BuiltinManageableProvider = (typeof MANAGEABLE_PROVIDER_ROWS)[number]
+
+/**
+ * A row in /provider: either a built-in manageable provider or a
+ * user-defined custom provider id from settings.json (`customProviders`).
+ * Custom ids are arbitrary strings, so the union is widened to string.
+ */
+type ManageableProvider = BuiltinManageableProvider | string
+
+/**
+ * The full provider row list: built-ins followed by custom providers declared
+ * in trusted settings. Custom ids are appended so users can activate them the
+ * same way they activate a built-in provider.
+ */
+function getProviderRows(): string[] {
+  // Re-read settings so a custom provider added since startup shows up.
+  resetCustomProviderCache()
+  return [...MANAGEABLE_PROVIDER_ROWS, ...getCustomProviders().map(p => p.id)]
+}
 
 /** Storage key for the user-supplied Ollama base URL (persisted in provider-keys.json). */
 const OLLAMA_BASE_URL_KEY = 'ollama_base_url'
 const OLLAMA_DEFAULT_BASE = 'http://localhost:11434'
 const LMSTUDIO_BASE_URL_KEY = 'lmstudio_base_url'
 const LMSTUDIO_DEFAULT_BASE = 'http://localhost:1234/v1'
+
+/**
+ * Synthetic row id for the "Add custom provider" action appended to the list.
+ * Not a real provider — selecting it opens the add wizard.
+ */
+const ADD_CUSTOM_SENTINEL = '__add_custom_provider__'
 
 type KeyedProvider = Exclude<
   ManageableProvider,
@@ -142,7 +180,11 @@ type KeyedProvider = Exclude<
 
 function getManageableProviderName(provider: ManageableProvider): string {
   if (provider === E2B_SECURITY_PROVIDER) return E2B_SECURITY_DISPLAY_NAME
-  return PROVIDER_DISPLAY_NAMES[provider]
+  if (provider === ADD_CUSTOM_SENTINEL) return '＋ Add custom provider'
+  if (isCustomProvider(provider)) {
+    return getCustomProvider(provider)?.name ?? provider
+  }
+  return PROVIDER_DISPLAY_NAMES[provider as APIProvider]
 }
 
 // ─── Auth state helpers ──────────────────────────────────────────
@@ -160,6 +202,11 @@ function hasFirstPartyAuth(): boolean {
 }
 
 function getAuthState(provider: KeyedProvider): AuthState {
+  // Custom providers store their key under their own id; the "configured"
+  // state is whether a key is resolvable (env `<ID>_API_KEY` or saved key).
+  if (isCustomProvider(provider)) {
+    return getCustomProviderApiKey(provider) ? 'api_key' : 'inactive'
+  }
   // Gemini row = CLI-tier OAuth (free flash/lite) or AI Studio API key.
   if (provider === 'gemini') {
     if (hasStoredKey('gemini_oauth_cli') || hasStoredKey('gemini_oauth')) return 'oauth'
@@ -307,6 +354,20 @@ type View =
       kind: 'lmstudio_url_input'
       error?: string
     }
+  | {
+      kind: 'custom_form'
+      mode: 'add' | 'edit'
+      id?: string
+      /** Ordered field names for this wizard run (add vs edit differ). */
+      steps: CustomFormStep[]
+      /** Index into `steps`. */
+      step: number
+      /** Cursor for the protocol menu (0 = openai, 1 = anthropic). */
+      protocolCursor: number
+      draft: CustomProviderDraft
+      error?: string
+    }
+  | { kind: 'custom_delete'; id: string; selectedIndex: number }
   | { kind: 'provider_login'; provider: KeyedProvider }
   | { kind: 'anthropic_login' }
   | { kind: 'e2b_login' }
@@ -317,10 +378,31 @@ type View =
       tone: 'success' | 'error'
     }
 
+/** Fields of the custom provider add/edit wizard, in flow order. */
+type CustomFormStep = 'id' | 'name' | 'protocol' | 'baseUrl' | 'apiKey'
+
+function customFormSteps(mode: 'add' | 'edit'): CustomFormStep[] {
+  return mode === 'add'
+    ? ['id', 'name', 'protocol', 'baseUrl', 'apiKey']
+    : ['name', 'protocol', 'baseUrl', 'apiKey']
+}
+
+/** In-progress custom provider definition in the add/edit wizard. */
+type CustomProviderDraft = {
+  id: string
+  name: string
+  protocol: 'anthropic' | 'openai'
+  baseUrl: string
+  /** API key typed in the wizard ('' = skip / keep existing). */
+  apiKey: string
+}
+
 type ConfigureOption =
   | { kind: 'activate' }
   | { kind: 'login' }
   | { kind: 'deactivate' }
+  | { kind: 'edit_custom' }
+  | { kind: 'remove_custom' }
   | { kind: 'set_ollama_url' }
   | { kind: 'reset_ollama_url' }
   | { kind: 'test_ollama' }
@@ -352,6 +434,27 @@ function buildConfigureOptions(
   ollamaStatus: OllamaStatus,
   lmStudioStatus: LmStudioStatus,
 ): ConfigureOption[] {
+  // Custom providers: activate / edit / remove. There is no OAuth flow.
+  if (isCustomProvider(provider)) {
+    const options: ConfigureOption[] = []
+    if (getAPIProvider() !== provider) {
+      options.push({ kind: 'activate' })
+    }
+    // Policy-managed providers are read-only here — hide edit/remove so the
+    // user is not told a change succeeded when it cannot be persisted.
+    if (!isPolicyOnlyCustomProvider(provider)) {
+      options.push({ kind: 'edit_custom' })
+    }
+    if (getAuthState(provider) !== 'inactive') {
+      options.push({ kind: 'deactivate' })
+    }
+    if (!isPolicyOnlyCustomProvider(provider)) {
+      options.push({ kind: 'remove_custom' })
+    }
+    options.push({ kind: 'back' })
+    return options
+  }
+
   if (provider === E2B_SECURITY_PROVIDER) {
     const options: ConfigureOption[] = []
     options.push({ kind: 'login' })
@@ -450,6 +553,10 @@ function labelConfigureOption(
       return provider === E2B_SECURITY_PROVIDER
         ? 'Clear E2B credentials'
         : 'Deactivate (clear all credentials)'
+    case 'edit_custom':
+      return 'Edit name / protocol / base URL'
+    case 'remove_custom':
+      return 'Remove provider (delete from settings)'
     case 'set_ollama_url':
       return 'Set custom base URL'
     case 'reset_ollama_url':
@@ -486,10 +593,21 @@ function ProviderManager({
   const [refreshTick, setRefreshTick] = useState(0)
   const refresh = () => setRefreshTick(t => t + 1)
 
+  // Built-in rows + custom provider ids + the "Add custom provider" action.
+  // Recomputed on refresh so a provider added/edited below shows up without
+  // restarting the CLI.
+  const providerRows = React.useMemo(
+    () => [...getProviderRows(), ADD_CUSTOM_SENTINEL],
+    [refreshTick],
+  )
+
   const [ollamaUrlInput, setOllamaUrlInput] = useState('')
   const [ollamaUrlCursorOffset, setOllamaUrlCursorOffset] = useState(0)
   const [lmStudioUrlInput, setLmStudioUrlInput] = useState('')
   const [lmStudioUrlCursorOffset, setLmStudioUrlCursorOffset] = useState(0)
+  // Text input state for the custom provider add/edit wizard.
+  const [customFieldInput, setCustomFieldInput] = useState('')
+  const [customFieldCursorOffset, setCustomFieldCursorOffset] = useState(0)
   const inputColumns = Math.max(20, (process.stdout.columns ?? 80) - 14)
 
   // Live reachability status for Ollama, computed when we first render
@@ -533,7 +651,45 @@ function ProviderManager({
   // ─── Handlers ─────────────────────────────────────────────────
 
   function enterConfigure(provider: ManageableProvider) {
+    if (provider === ADD_CUSTOM_SENTINEL) {
+      // Open the add wizard with an empty draft.
+      setCustomFieldInput('')
+      setCustomFieldCursorOffset(0)
+      setView({
+        kind: 'custom_form',
+        mode: 'add',
+        steps: customFormSteps('add'),
+        step: 0,
+        protocolCursor: 0,
+        draft: { id: '', name: '', protocol: 'openai', baseUrl: '', apiKey: '' },
+      })
+      return
+    }
     setView({ kind: 'configure', provider, selectedIndex: 0 })
+  }
+
+  /** Open the edit wizard pre-filled from an existing custom provider. */
+  function enterEditCustom(id: string) {
+    const existing = getCustomProvider(id)
+    if (!existing) return
+    setCustomFieldInput('')
+    setCustomFieldCursorOffset(0)
+    setView({
+      kind: 'custom_form',
+      mode: 'edit',
+      id,
+      // Edit starts at the name field (id is immutable).
+      steps: customFormSteps('edit'),
+      step: 0,
+      protocolCursor: existing.protocol === 'anthropic' ? 1 : 0,
+      draft: {
+        id: existing.id,
+        name: existing.name,
+        protocol: existing.protocol,
+        baseUrl: existing.baseUrl,
+        apiKey: '',
+      },
+    })
   }
 
   function backToList() {
@@ -541,8 +697,12 @@ function ProviderManager({
     const lastProvider =
       view.kind === 'configure' || view.kind === 'result'
         ? view.provider
-        : undefined
-    const idx = lastProvider ? MANAGEABLE_PROVIDER_ROWS.indexOf(lastProvider) : 0
+        : view.kind === 'custom_delete'
+          ? view.id
+          : view.kind === 'custom_form' && view.id
+            ? view.id
+            : undefined
+    const idx = lastProvider ? providerRows.indexOf(lastProvider) : 0
     setView({ kind: 'list', selectedIndex: idx >= 0 ? idx : 0 })
   }
 
@@ -585,6 +745,216 @@ function ProviderManager({
       provider: 'lmstudio',
       tone: 'success',
       message: 'LM Studio activated.',
+    })
+  }
+
+  function handleActivateCustom(id: string) {
+    setActiveProvider(id as APIProvider)
+    // Strip thinking-block signatures bound to the previously-active provider.
+    setMessages(stripSignatureBlocks)
+    refresh()
+    setView({
+      kind: 'result',
+      provider: id,
+      tone: 'success',
+      message: `${getManageableProviderName(id)} activated.`,
+    })
+  }
+
+  // ─── Custom provider add/edit wizard ──────────────────────────
+  //
+  // Field order (add):   id → name → protocol → baseUrl → apiKey
+  // Field order (edit):        name → protocol → baseUrl → apiKey
+  // Text steps use a single TextInput; `protocol` is a two-option menu;
+  // `apiKey` is optional (blank skips on add, keeps existing on edit).
+
+  function currentCustomStep(
+    form: Extract<View, { kind: 'custom_form' }>,
+  ): CustomFormStep | undefined {
+    return form.steps[form.step]
+  }
+
+  function validateCustomField(
+    form: Extract<View, { kind: 'custom_form' }>,
+    raw: string,
+  ): { value?: string; error?: string } {
+    const step = currentCustomStep(form)
+    const value = raw.trim()
+    switch (step) {
+      case 'id': {
+        if (!value) return { error: 'Provider id is required.' }
+        if (!/^[a-z0-9][a-z0-9_-]*$/.test(value)) {
+          return {
+            error:
+              'Id must be lowercase letters, digits, "-" or "_" (e.g. myproxy).',
+          }
+        }
+        if (isReservedProviderId(value)) {
+          return {
+            error: `"${value}" is a built-in provider id. Pick a different id.`,
+          }
+        }
+        if (isCustomProvider(value)) {
+          return { error: `A provider with id "${value}" already exists.` }
+        }
+        return { value }
+      }
+      case 'name':
+        if (!value) return { error: 'Name is required.' }
+        return { value }
+      case 'baseUrl': {
+        if (!value) return { error: 'Base URL is required.' }
+        try {
+          const url = new URL(value)
+          if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+            return { error: 'URL must start with http:// or https://' }
+          }
+        } catch {
+          return {
+            error: 'Not a valid URL (e.g. https://api.example.com/v1).',
+          }
+        }
+        return { value }
+      }
+      case 'apiKey':
+      case 'protocol':
+      default:
+        return { value }
+    }
+  }
+
+  function advanceCustomForm(
+    form: Extract<View, { kind: 'custom_form' }>,
+    draft: CustomProviderDraft,
+  ): void {
+    if (form.step >= form.steps.length - 1) {
+      finishCustomForm(form, draft)
+      return
+    }
+    setCustomFieldInput('')
+    setCustomFieldCursorOffset(0)
+    setView({ ...form, step: form.step + 1, draft, error: undefined })
+  }
+
+  function finishCustomForm(
+    form: Extract<View, { kind: 'custom_form' }>,
+    draft: CustomProviderDraft,
+  ): void {
+    const provider: CustomProvider = {
+      id: draft.id,
+      name: draft.name,
+      protocol: draft.protocol,
+      baseUrl: draft.baseUrl,
+    }
+    const error =
+      form.mode === 'add'
+        ? addUserCustomProvider(provider)
+        : updateUserCustomProvider(form.id!, {
+            name: provider.name,
+            protocol: provider.protocol,
+            baseUrl: provider.baseUrl,
+          })
+    if (error) {
+      setView({ ...form, error })
+      return
+    }
+    // Persist the API key when the user typed one (blank = skip / keep).
+    let keyNote = ''
+    if (draft.apiKey) {
+      try {
+        saveProviderKey(provider.id, draft.apiKey)
+        process.env[`${provider.id.toUpperCase().replace(/-/g, '_')}_API_KEY`] =
+          draft.apiKey
+        keyNote = ' API key saved.'
+      } catch (e) {
+        keyNote = ` (provider saved, but the API key could not be stored: ${
+          e instanceof Error ? e.message : String(e)
+        })`
+      }
+    }
+    refresh()
+    setCustomFieldInput('')
+    setCustomFieldCursorOffset(0)
+    setView({
+      kind: 'result',
+      provider: provider.id,
+      tone: 'success',
+      message:
+        (form.mode === 'add'
+          ? `Custom provider "${provider.name}" added.`
+          : `Custom provider "${provider.name}" updated.`) + keyNote,
+    })
+  }
+
+  function handleCustomFieldSubmit(raw: string) {
+    if (view.kind !== 'custom_form') return
+    const form = view
+    const step = currentCustomStep(form)
+    // The protocol step is a menu, not a text field.
+    if (step === 'protocol') return
+    const { value, error } = validateCustomField(form, raw)
+    if (error !== undefined) {
+      setView({ ...form, error })
+      return
+    }
+    const draft: CustomProviderDraft = { ...form.draft }
+    if (step === 'id') draft.id = value!
+    else if (step === 'name') draft.name = value!
+    else if (step === 'baseUrl') draft.baseUrl = value!
+    else if (step === 'apiKey') draft.apiKey = value!
+    advanceCustomForm(form, draft)
+  }
+
+  function handleCustomProtocolConfirm() {
+    if (view.kind !== 'custom_form') return
+    const form = view
+    const draft: CustomProviderDraft = {
+      ...form.draft,
+      protocol: form.protocolCursor === 1 ? 'anthropic' : 'openai',
+    }
+    advanceCustomForm(form, draft)
+  }
+
+  function cancelCustomForm() {
+    if (view.kind !== 'custom_form') return
+    setCustomFieldInput('')
+    setCustomFieldCursorOffset(0)
+    if (view.mode === 'edit' && view.id) {
+      setView({ kind: 'configure', provider: view.id, selectedIndex: 0 })
+    } else {
+      backToList()
+    }
+  }
+
+  function handleRemoveCustom(id: string) {
+    const name = getManageableProviderName(id)
+    // Guard against a policy-managed provider: removeUserCustomProvider only
+    // edits userSettings, so it would silently no-op and falsely report success.
+    if (isPolicyOnlyCustomProvider(id)) {
+      setView({
+        kind: 'result',
+        provider: id,
+        tone: 'error',
+        message: `${name} is managed by policy and cannot be removed here.`,
+      })
+      return
+    }
+    const error = removeUserCustomProvider(id)
+    refresh()
+    if (error) {
+      setView({ kind: 'result', provider: id, tone: 'error', message: error })
+      return
+    }
+    // If the removed provider was active, fall back to Anthropic.
+    if (getAPIProvider() === id) {
+      setActiveProvider('firstParty')
+      setMessages(stripSignatureBlocks)
+    }
+    setView({
+      kind: 'result',
+      provider: id,
+      tone: 'success',
+      message: `${name} removed.`,
     })
   }
 
@@ -786,13 +1156,37 @@ function ProviderManager({
     if (
       key.escape &&
       view.kind !== 'ollama_url_input' &&
-      view.kind !== 'lmstudio_url_input'
+      view.kind !== 'lmstudio_url_input' &&
+      view.kind !== 'custom_form'
     ) {
       if (view.kind === 'list') {
         onDone('Provider setup closed.', { display: 'system' })
         return
       }
       backToList()
+      return
+    }
+
+    // custom_form: Esc cancels the wizard (TextInput's own Esc is disabled via
+    // the component's escape handling, so we route it here).
+    if (view.kind === 'custom_form' && key.escape) {
+      cancelCustomForm()
+      return
+    }
+
+    // custom_form protocol step: up/down pick the protocol, Enter confirms.
+    if (view.kind === 'custom_form' && currentCustomStep(view) === 'protocol') {
+      if (key.upArrow || key.downArrow) {
+        setView({
+          ...view,
+          protocolCursor: view.protocolCursor === 0 ? 1 : 0,
+        })
+        return
+      }
+      if (key.return) {
+        handleCustomProtocolConfirm()
+        return
+      }
       return
     }
 
@@ -819,7 +1213,7 @@ function ProviderManager({
           selectedIndex:
             view.selectedIndex > 0
               ? view.selectedIndex - 1
-              : MANAGEABLE_PROVIDER_ROWS.length - 1,
+              : providerRows.length - 1,
         })
         return
       }
@@ -827,14 +1221,14 @@ function ProviderManager({
         setView({
           kind: 'list',
           selectedIndex:
-            view.selectedIndex < MANAGEABLE_PROVIDER_ROWS.length - 1
+            view.selectedIndex < providerRows.length - 1
               ? view.selectedIndex + 1
               : 0,
         })
         return
       }
       if (key.return) {
-        const provider = MANAGEABLE_PROVIDER_ROWS[view.selectedIndex]
+        const provider = providerRows[view.selectedIndex]
         if (provider) enterConfigure(provider)
         return
       }
@@ -875,6 +1269,9 @@ function ProviderManager({
             if (view.provider === 'lmstudio') {
               handleActivateLmStudio()
             }
+            if (isCustomProvider(view.provider)) {
+              handleActivateCustom(view.provider)
+            }
             return
           case 'login':
             if (view.provider === 'firstParty') {
@@ -899,6 +1296,12 @@ function ProviderManager({
             if (view.provider !== 'ollama' && view.provider !== 'lmstudio') {
               handleDeactivate(view.provider)
             }
+            return
+          case 'edit_custom':
+            enterEditCustom(view.provider)
+            return
+          case 'remove_custom':
+            setView({ kind: 'custom_delete', id: view.provider, selectedIndex: 0 })
             return
           case 'set_ollama_url':
             setOllamaUrlInput('')
@@ -930,6 +1333,23 @@ function ProviderManager({
       return
     }
 
+    // ─── custom provider delete confirmation ───
+    if (view.kind === 'custom_delete') {
+      if (key.upArrow || key.downArrow) {
+        setView({ ...view, selectedIndex: view.selectedIndex === 0 ? 1 : 0 })
+        return
+      }
+      if (key.return) {
+        if (view.selectedIndex === 0) {
+          handleRemoveCustom(view.id)
+        } else {
+          setView({ kind: 'configure', provider: view.id, selectedIndex: 0 })
+        }
+        return
+      }
+      return
+    }
+
     // ─── result view ───
     if (view.kind === 'result') {
       if (key.return) backToList()
@@ -956,22 +1376,24 @@ function ProviderManager({
           can be active at once.
         </Text>
         <Box marginTop={1} flexDirection="column">
-          {MANAGEABLE_PROVIDER_ROWS.map((provider, i) => {
+          {providerRows.map((provider, i) => {
             const isSelected = i === view.selectedIndex
+            const isAddRow = provider === ADD_CUSTOM_SENTINEL
             const name = getManageableProviderName(provider)
             const prefix = isSelected ? '>' : ' '
-            const badge =
-              provider === E2B_SECURITY_PROVIDER
+            const badge = isAddRow
+              ? chalk.dim('[ new ]')
+              : provider === E2B_SECURITY_PROVIDER
                 ? chalk.green(formatE2BSecurityBadge())
                 : provider === 'ollama'
-                ? formatOllamaBadge(ollamaStatus)
-                : provider === 'lmstudio'
-                ? formatLmStudioBadge(lmStudioStatus)
-                : provider === 'gemini'
-                  ? formatGeminiBadge()
-                  : provider === 'firstParty'
-                    ? formatBadge(getFirstPartyAuthState())
-                    : formatBadge(getAuthState(provider))
+                  ? formatOllamaBadge(ollamaStatus)
+                  : provider === 'lmstudio'
+                    ? formatLmStudioBadge(lmStudioStatus)
+                    : provider === 'gemini'
+                      ? formatGeminiBadge()
+                      : provider === 'firstParty'
+                        ? formatBadge(getFirstPartyAuthState())
+                        : formatBadge(getAuthState(provider))
             return (
               <Box key={provider}>
                 <Text
@@ -979,7 +1401,7 @@ function ProviderManager({
                   color={isSelected ? 'claude' : undefined}
                   dimColor={!isSelected}
                 >
-                  {prefix} {name.padEnd(16)}
+                  {prefix} {name.padEnd(24)}
                 </Text>
                 <Text> {badge}</Text>
               </Box>
@@ -1016,7 +1438,9 @@ function ProviderManager({
         ? getOllamaBaseUrl()
         : provider === 'lmstudio'
           ? getLmStudioBaseUrl()
-          : null
+          : isCustomProvider(provider)
+            ? getCustomProvider(provider)?.baseUrl ?? null
+            : null
     return (
       <Box flexDirection="column" paddingLeft={1}>
         {header}
@@ -1127,6 +1551,153 @@ function ProviderManager({
     )
   }
 
+  if (view.kind === 'custom_form') {
+    const isAdd = view.mode === 'add'
+    const step = currentCustomStep(view)!
+    const total = view.steps.length
+    const title = isAdd ? 'Add custom provider' : `Edit "${view.id}"`
+
+    const stepMeta: Record<
+      CustomFormStep,
+      { label: string; placeholder: string; hint?: string; mask?: string }
+    > = {
+      id: {
+        label: 'Provider id',
+        placeholder: 'myproxy',
+        hint: 'lowercase letters, digits, "-" or "_" — env var MYPROXY_API_KEY',
+      },
+      name: { label: 'Display name', placeholder: 'My Internal AI Proxy' },
+      protocol: { label: 'Protocol', placeholder: '' },
+      baseUrl: {
+        label: 'Base URL',
+        placeholder: 'https://api.example.com/v1',
+        hint: 'include /v1 if the server needs it',
+      },
+      apiKey: {
+        label: 'API key',
+        placeholder: '(optional — Enter to skip)',
+        hint: 'stored locally; blank = skip (add) or keep existing (edit)',
+        mask: '•',
+      },
+    }
+
+    // Fields already collected, shown for context.
+    const collected: Array<[string, string]> = []
+    if (isAdd && view.draft.id) collected.push(['id', view.draft.id])
+    if (view.draft.name) collected.push(['name', view.draft.name])
+    if (view.steps.indexOf('protocol') < view.step) {
+      collected.push(['protocol', view.draft.protocol])
+    }
+    if (view.draft.baseUrl) collected.push(['base URL', view.draft.baseUrl])
+
+    return (
+      <Box flexDirection="column" paddingLeft={1}>
+        {header}
+        <Text bold>{title}</Text>
+        <Text dimColor>
+          Step {view.step + 1} of {total}
+          {!isAdd ? ' · id is fixed' : ''}
+        </Text>
+        {collected.length > 0 && (
+          <Box marginTop={1} flexDirection="column">
+            {collected.map(([k, v]) => (
+              <Text key={k} dimColor>
+                {k}: {v}
+              </Text>
+            ))}
+          </Box>
+        )}
+        {view.error && (
+          <Box marginTop={1}>
+            <Text color="error">{view.error}</Text>
+          </Box>
+        )}
+        {step === 'protocol' ? (
+          <Box marginTop={1} flexDirection="column">
+            <Text>Protocol:</Text>
+            {(['openai', 'anthropic'] as const).map((p, i) => {
+              const sel = i === view.protocolCursor
+              return (
+                <Text
+                  key={p}
+                  bold={sel}
+                  color={sel ? 'claude' : undefined}
+                  dimColor={!sel}
+                >
+                  {sel ? '>' : ' '} {p}
+                  {p === 'openai' ? '  (Chat Completions)' : '  (Messages API)'}
+                </Text>
+              )
+            })}
+            <Box marginTop={1}>
+              <Text dimColor>↑↓ select · Enter to continue · Esc to cancel</Text>
+            </Box>
+          </Box>
+        ) : (
+          <Box flexDirection="column">
+            <Box marginTop={1}>
+              <Text>{stepMeta[step].label}: </Text>
+              <TextInput
+                value={customFieldInput}
+                onChange={setCustomFieldInput}
+                onSubmit={handleCustomFieldSubmit}
+                placeholder={stepMeta[step].placeholder}
+                mask={stepMeta[step].mask}
+                focus={true}
+                showCursor={true}
+                columns={inputColumns}
+                cursorOffset={customFieldCursorOffset}
+                onChangeCursorOffset={setCustomFieldCursorOffset}
+              />
+            </Box>
+            {stepMeta[step].hint && <Text dimColor>{stepMeta[step].hint}</Text>}
+            <Box marginTop={1}>
+              <Text dimColor>Enter to continue · Esc to cancel</Text>
+            </Box>
+          </Box>
+        )}
+      </Box>
+    )
+  }
+
+  if (view.kind === 'custom_delete') {
+    const name = getManageableProviderName(view.id)
+    const options = [
+      `Yes, remove "${name}"`,
+      'Cancel',
+    ]
+    return (
+      <Box flexDirection="column" paddingLeft={1}>
+        {header}
+        <Text bold>Remove custom provider</Text>
+        <Text>
+          Delete <Text bold>{name}</Text> from settings?
+        </Text>
+        <Text dimColor>
+          This only edits your settings.json — stored API keys are kept.
+        </Text>
+        <Box marginTop={1} flexDirection="column">
+          {options.map((label, i) => {
+            const isSelected = i === view.selectedIndex
+            return (
+              <Text
+                key={label}
+                bold={isSelected}
+                color={isSelected ? 'claude' : undefined}
+                dimColor={!isSelected}
+              >
+                {isSelected ? '>' : ' '} {label}
+              </Text>
+            )
+          })}
+        </Box>
+        <Box marginTop={1}>
+          <Text dimColor>↑↓ navigate · Enter to select · Esc to go back</Text>
+        </Box>
+      </Box>
+    )
+  }
+
   if (view.kind === 'anthropic_login') {
     return <AnthropicLogin onDone={handleAnthropicLoginDone} />
   }
@@ -1139,7 +1710,7 @@ function ProviderManager({
     const provider = view.provider
     return (
       <ProviderLoginFlow
-        provider={provider}
+        provider={provider as APIProvider}
         onDone={(success) => {
           refresh()
           setView({

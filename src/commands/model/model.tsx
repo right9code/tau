@@ -33,8 +33,9 @@ import {
 import { renderModelLabelForProvider } from '../../utils/model/display.js'
 import { isModelAllowed } from '../../utils/model/modelAllowlist.js'
 import {
-  BROWSABLE_MODEL_PROVIDERS,
+  getBrowsableModelProviders,
   getProviderBrowseLabel,
+  type AnyBrowsableModelProvider,
   type BrowsableModelProvider,
 } from '../../utils/model/providerCatalog.js'
 import { getAPIProvider, isThirdPartyProvider } from '../../utils/model/providers.js'
@@ -135,7 +136,7 @@ function ModelPickerWrapper({
   const currentProvider = getAPIProvider()
   const lockedProvider =
     isThirdPartyProvider(currentProvider)
-    && BROWSABLE_MODEL_PROVIDERS.includes(currentProvider as BrowsableModelProvider)
+    && getBrowsableModelProviders().includes(currentProvider as BrowsableModelProvider)
       ? (currentProvider as BrowsableModelProvider)
       : null
 
@@ -173,7 +174,7 @@ function ModelPickerWrapper({
   }
 
   function handleProviderSelect(
-    provider: BrowsableModelProvider,
+    provider: AnyBrowsableModelProvider,
     modelId: string,
     effort?: EffortLevel,
   ): void {

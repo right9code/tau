@@ -171,3 +171,56 @@ session's thinking budget, and the choice persists in
 ## Switching providers mid-session
 
 Hit a rate limit, run out of credit, or want to compare outputs? Type `/login` or `/models` at any time. Tau swaps the active provider without ending the session: your conversation, file context, and tool history stay intact. The new provider just picks up where the last one left off.
+
+## Custom providers
+
+Any endpoint that speaks the OpenAI Chat Completions or the Anthropic
+Messages wire format can be used without a built-in provider row. Declare it
+under `customProviders` in the trusted `~/.claude/settings.json` (or a managed
+policy settings file):
+
+```json
+{
+  "customProviders": [
+    {
+      "id": "myproxy",
+      "name": "My Internal Gateway",
+      "protocol": "openai",
+      "baseUrl": "https://api.example.com/v1"
+    }
+  ]
+}
+```
+
+- `id` — lowercase letters, digits, `-` or `_`; it may not collide with a
+  built-in provider id. It is the provider id shown in `/provider` and `/models`
+  and the basis for the env vars below.
+- `protocol` — `"openai"` (Chat Completions) or `"anthropic"` (Messages API).
+- `baseUrl` — full API base URL, including `/v1` when the server expects it.
+- `models` — optional manual catalog (`[{ "id": "...", "name": "..." }]`) used
+  as a fallback when the server's `/v1/models` is unavailable.
+
+`baseUrl` is read only from trusted settings sources (`userSettings`,
+`policySettings`); project and local settings are ignored, because a base URL
+is an exfiltration vector.
+
+### Managing custom providers
+
+Run `/provider` and pick **＋ Add custom provider** to create one through a
+five-step wizard (id → name → protocol → base URL → API key). Existing custom
+rows support **Activate**, **Edit**, and **Remove**. Custom providers appear at
+the bottom of the `/models` and `/models` provider list, and their model
+catalog is fetched live from `<baseUrl>/v1/models` and merged with any declared
+`models`.
+
+### API keys
+
+Keys are never stored in the settings file. They resolve in this order:
+
+1. Environment variable `<ID>_API_KEY` — uppercased, hyphens become
+   underscores (`my-proxy` → `MY_PROXY_API_KEY`).
+2. The key saved by the `/provider` wizard, stored in
+   `~/.config/claude-code/provider-keys.json`.
+
+The base URL can be overridden at runtime with `<ID>_BASE_URL`; the override
+applies to both model listing and chat requests.
