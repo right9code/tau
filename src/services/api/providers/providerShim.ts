@@ -624,6 +624,32 @@ export function createProviderShim(provider: APIProvider, source?: string): unkn
 }
 
 /**
+ * Wrap an already-constructed BaseProvider instance in the Anthropic-SDK
+ * duck-type interface. Used for custom (user-defined) providers whose ids
+ * are not in the compile-time APIProvider union and therefore cannot go
+ * through createProvider() / createProviderShim().
+ */
+export function createProviderShimFromBaseProvider(p: BaseProvider, source?: string): unknown {
+  const create = createMethod(p, source)
+  return {
+    beta: {
+      messages: {
+        create,
+        stream: (params: Record<string, unknown>) =>
+          p.stream({ ...params, stream: true } as any),
+      },
+    },
+    messages: {
+      create,
+      stream: (params: Record<string, unknown>) =>
+        p.stream({ ...params, stream: true } as any),
+    },
+    _provider: p,
+    _providerName: p.name,
+  }
+}
+
+/**
  * Get a provider instance directly (for listModels, etc.).
  */
 export function getProvider(provider: APIProvider): BaseProvider {

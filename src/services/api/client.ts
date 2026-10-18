@@ -20,7 +20,13 @@ import {
   isFirstPartyAnthropicBaseUrl,
   isThirdPartyProvider,
 } from 'src/utils/model/providers.js'
-import { createProviderShim } from './providers/providerShim.js'
+import {
+  getCustomProvider,
+  getCustomProviderApiKey,
+  getCustomProviderBaseUrl,
+  isCustomProvider,
+} from 'src/utils/customProviders.js'
+import { createProviderShim, createProviderShimFromBaseProvider } from './providers/providerShim.js'
 import { getProxyFetchOptions } from 'src/utils/proxy.js'
 import {
   getIsNonInteractiveSession,
@@ -91,6 +97,20 @@ function createStderrLogger(): ClientOptions['logger'] {
   }
 }
 
+/**
+ * Returns true when a third-party provider speaks the Anthropic Messages wire
+ * format rather than OpenAI Chat Completions. These providers are routed
+ * through the real Anthropic SDK client (pointed at the provider's base URL)
+ * so the full Claude Code request shape — tools, cache_control, extended
+ * thinking, streaming — flows without any translation layer.
+ *
+ * - agentrouter: official Anthropic-wire gateway (https://agentrouter.org/)
+ */
+function isAnthropicWireProvider(provider: string): boolean {
+  if (provider === 'agentrouter') return true
+  return false
+}
+
 export async function getAnthropicClient({
   apiKey,
   maxRetries,
@@ -138,7 +158,21 @@ export async function getAnthropicClient({
   await checkAndRefreshOAuthTokenIfNeeded()
   logForDebugging('[API:auth] OAuth token check complete')
 
-  if (!isClaudeAISubscriber()) {
+  // Resolve provider early so we can skip Anthropic key setup for
+  // third-party and custom providers — getApiKeyFromApiKeyHelper hangs
+  // waiting for a subprocess that only exists for Anthropic auth.
+  const configuredProvider = getAPIProvider()
+  const currentProvider = resolveEffectiveAPIProvider(configuredProvider, model)
+  if (currentProvider !== configuredProvider) {
+    logForDebugging(`[API:route] Auto-corrected provider ${configuredProvider} → ${currentProvider} for model ${model}`)
+  }
+
+  const _isCustom = isCustomProvider(currentProvider)
+  const _isThirdParty = isThirdPartyProvider(currentProvider)
+
+  // Only call configureApiKeyHeaders for Anthropic-native providers.
+  // Third-party and custom providers manage their own auth independently.
+  if (!isClaudeAISubscriber() && !_isThirdParty && !_isCustom) {
     await configureApiKeyHeaders(defaultHeaders, getIsNonInteractiveSession())
   }
 
@@ -148,16 +182,48 @@ export async function getAnthropicClient({
   // Route to the provider shim BEFORE checking Bedrock/Vertex/Foundry.
   // The shim duck-types the Anthropic SDK interface so withRetry,
   // streaming, and MCP tool loops all work unchanged.
-  //
-  // Auto-correct provider when the model clearly belongs to another.
-  // Prevents "openai API error 404: gemini-3.1-pro-low does not exist"
-  // when the user picks a Gemini model while /provider is set to openai.
-  const configuredProvider = getAPIProvider()
-  const currentProvider = resolveEffectiveAPIProvider(configuredProvider, model)
-  if (currentProvider !== configuredProvider) {
-    logForDebugging(`[API:route] Auto-corrected provider ${configuredProvider} → ${currentProvider} for model ${model}`)
+
+  // ── Custom (user-defined) providers ────────────────────────────────
+  // Custom providers are declared in userSettings / policySettings under
+  // `customProviders`. They are not in the compile-time APIProvider union, so
+  // we check them first and route them independently based on their protocol.
+  if (_isCustom) {
+    const customProvider = getCustomProvider(currentProvider)!
+    const apiKey = getCustomProviderApiKey(customProvider.id) ?? ''
+    // Honor the `<ID>_BASE_URL` env override exactly as the model picker does,
+    // so listing and chat never target different hosts.
+    const baseUrl =
+      getCustomProviderBaseUrl(customProvider.id) ?? customProvider.baseUrl
+
+    if (customProvider.protocol === 'anthropic') {
+      // Anthropic-wire: use real Anthropic SDK pointed at customer base URL.
+      const cleanBaseUrl = baseUrl.replace(/\/v1\/?$/i, '/')
+      return new Anthropic({
+        apiKey,
+        authToken: apiKey,
+        baseURL: cleanBaseUrl,
+        defaultHeaders,
+        maxRetries,
+        timeout: parseInt(process.env.API_TIMEOUT_MS || String(600 * 1000), 10),
+        dangerouslyAllowBrowser: true,
+        fetchOptions: getProxyFetchOptions({
+          forAnthropicAPI: true,
+        }) as ClientOptions['fetchOptions'],
+        ...(resolvedFetch && { fetch: resolvedFetch }),
+        ...(isDebugToStdErr() && { logger: createStderrLogger() }),
+      })
+    }
+
+    // OpenAI-wire: register with the openai-compat lane and return a shim.
+    // Dynamic import avoids a circular dep at module load time.
+    const { openaiCompatLane } = await import('../../lanes/openai-compat/loop.js')
+    openaiCompatLane.registerProvider(customProvider.id, apiKey, baseUrl)
+    const { LaneBackedProvider } = await import('../../lanes/provider-bridge.js')
+    const laneProvider = new LaneBackedProvider(openaiCompatLane, currentProvider as any)
+    return createProviderShimFromBaseProvider(laneProvider, source) as unknown as Anthropic
   }
-  if (isThirdPartyProvider(currentProvider)) {
+
+  if (_isThirdParty) {
     const authCheck = validateProviderAuth(currentProvider)
     if (!authCheck.valid) {
       throw new Error(authCheck.reason)
@@ -176,15 +242,15 @@ export async function getAnthropicClient({
     // ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY, so route the selectable provider
     // through the real Anthropic SDK client and let the SDK emit the Claude Code
     // request shape.
-    if (currentProvider === 'agentrouter') {
-      const agentRouterKey = getProviderApiKey('agentrouter')
-      if (!agentRouterKey) {
-        throw new Error('No credentials found for agentrouter. Set AGENT_ROUTER_TOKEN or run `/login`.')
+    if (isAnthropicWireProvider(currentProvider)) {
+      const providerKey = getProviderApiKey(currentProvider)
+      if (!providerKey) {
+        throw new Error(`No credentials found for ${currentProvider}. Set the API key or run \`/login\`.`)
       }
-      const baseURL = getProviderBaseUrl('agentrouter').replace(/\/v1\/?$/i, '/')
+      const baseURL = getProviderBaseUrl(currentProvider).replace(/\/v1\/?$/i, '/')
       return new Anthropic({
-        apiKey: agentRouterKey,
-        authToken: agentRouterKey,
+        apiKey: providerKey,
+        authToken: providerKey,
         baseURL,
         defaultHeaders,
         maxRetries,

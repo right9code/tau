@@ -8,6 +8,7 @@ import {
   SELECTABLE_PROVIDERS,
   type APIProvider,
 } from './providerRegistry.js'
+import { isCustomProvider } from '../customProviders.js'
 
 export type { APIProvider } from './providerRegistry.js'
 export { API_PROVIDERS, SELECTABLE_PROVIDERS } from './providerRegistry.js'
@@ -40,6 +41,12 @@ function _resolveAPIProvider(): APIProvider {
   // 1. Check persistent config first (set by /provider command)
   const configured = getGlobalConfig().activeProvider
   if (configured && VALID_PROVIDERS.includes(configured as APIProvider)) {
+    return configured as APIProvider
+  }
+  // 1b. Accept custom provider ids stored in config — these are not in the
+  //     compile-time APIProvider union. The cast is intentional: routing in
+  //     client.ts checks isCustomProvider() before hitting the static switch.
+  if (configured && isCustomProvider(configured)) {
     return configured as APIProvider
   }
   // 2. Fall back to environment variables
@@ -246,6 +253,12 @@ export function isOpenAICompatibleProvider(p: APIProvider): boolean {
 
 /** All non-Anthropic third-party LLM providers */
 export function isThirdPartyProvider(p: APIProvider): boolean {
+  // User-defined custom providers (settings.json `customProviders`) are never
+  // Anthropic-native, so they must follow the third-party fallbacks: model
+  // strings resolve to the firstParty canonical set, and the default
+  // sonnet/haiku ids come from getProviderModelSet()'s generic fallback
+  // instead of an unknown-provider config lookup that returns undefined.
+  if (isCustomProvider(p)) return true
   return ['openai', 'gemini', 'antigravity', 'openrouter', 'agentrouter', 'modelrouter', 'vercel', 'requesty', 'opencode', 'opencodego', 'commandcode', 'lxd', 'mimo', 'fireworks', 'cloudflare', 'groq', 'mistral', 'nim', 'deepseek', 'glm', 'moonshot', 'minimax', 'alibaba', 'ollama', 'lmstudio',
           'cline', 'clinepass', 'copilot', 'cursor', 'iflow', 'kilocode', 'kiro'].includes(p)
 }
