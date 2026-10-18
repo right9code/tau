@@ -175,6 +175,8 @@ function detectKeyFormat(provider: string, key: string): string {
     gemini: 'AIza',
     deepseek: 'sk-',
     moonshot: 'sk-',
+    xai: 'xai-',
+    meta: 'LLM_',
     firecrawl: 'fc-',
   }
   const expected = prefixes[provider]
@@ -213,6 +215,8 @@ const KEY_VALIDATIONS: Record<string, KeyValidation> = {
   moonshot: { prefix: 'sk-', minLength: 20, displayName: 'Moonshot AI' },
   minimax: { prefix: '', minLength: 10, displayName: 'MiniMax AI' },
   alibaba: { prefix: '', minLength: 10, displayName: 'Alibaba Model Studio' },
+  xai: { prefix: 'xai-', minLength: 20, displayName: 'xAI' },
+  meta: { prefix: 'LLM_', minLength: 20, displayName: 'Meta' },
   firecrawl: { prefix: 'fc-', minLength: 10, displayName: 'Firecrawl' },
 }
 
@@ -285,6 +289,18 @@ export function deleteAllProviderCredentials(provider: string): void {
     delete process.env.CLOUDFLARE_API_TOKEN
     delete process.env.CLOUDFLARE_API_KEY
     delete process.env.CLOUDFLARE_WORKERS_AI_TOKEN
+  }
+  if (provider === 'xai') {
+    // The optional management key (billing for /usage) goes with the API key.
+    deleteProviderKey('xai_management')
+    delete process.env.XAI_API_KEY
+    delete process.env.XAI_MANAGEMENT_API_KEY
+  }
+  if (provider === 'meta') {
+    delete process.env.META_API_KEY
+    delete process.env.META_MODEL_API_KEY
+    // MODEL_API_KEY is generic; it was Meta's only in Meta's key shape.
+    if (process.env.MODEL_API_KEY?.trim().startsWith('LLM_')) delete process.env.MODEL_API_KEY
   }
 
   // Keep lane-backed providers in sync with credential deletion so the
@@ -361,11 +377,13 @@ export function deleteAllProviderCredentials(provider: string): void {
     provider === 'alibaba' ||
     provider === 'fireworks' ||
     provider === 'cloudflare' ||
+    provider === 'xai' ||
+    provider === 'meta' ||
     provider === 'groq'
   ) {
     void import('../providers/providerShim.js')
       .then(({ reloadOpenAICompatProviderAuth }) =>
-        reloadOpenAICompatProviderAuth(provider as 'modelrouter' | 'vercel' | 'requesty' | 'opencode' | 'opencodego' | 'commandcode' | 'fireworks' | 'cloudflare' | 'groq' | 'alibaba'),
+        reloadOpenAICompatProviderAuth(provider as 'modelrouter' | 'vercel' | 'requesty' | 'opencode' | 'opencodego' | 'commandcode' | 'fireworks' | 'cloudflare' | 'xai' | 'meta' | 'groq' | 'alibaba'),
       )
       .catch(() => {})
   }

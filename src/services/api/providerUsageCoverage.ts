@@ -24,6 +24,8 @@ export const PROVIDERS_WITH_USAGE_REPORTERS = [
   'lxd',
   'mimo',
   'alibaba',
+  'xai',
+  'meta',
   'moonshot',
   'minimax',
   'ollama',

@@ -190,6 +190,9 @@ export function antigravityGenerationHostCount(_model: string | undefined): numb
 // daily Antigravity endpoint. They share the `userAgent: "antigravity"`
 // envelope but need small content-level fixes (see wrapForCodeAssist).
 export const ANTIGRAVITY_MODELS: readonly ModelInfo[] = [
+  { id: 'gemini-4-argon-high', name: 'Gemini 4 Argon (High)', contextWindow: 1048576 },
+  { id: 'gemini-4-argon-medium', name: 'Gemini 4 Argon (Medium)', contextWindow: 1048576 },
+  { id: 'gemini-4-argon-low', name: 'Gemini 4 Argon (Low)', contextWindow: 1048576 },
   { id: 'gemini-3.8-flash-high', name: 'Gemini 3.8 Flash (High)', contextWindow: 1048576 },
   { id: 'gemini-3.8-flash-medium', name: 'Gemini 3.8 Flash (Medium)', contextWindow: 1048576 },
   { id: 'gemini-3.8-flash-low', name: 'Gemini 3.8 Flash (Low)', contextWindow: 1048576 },
@@ -228,15 +231,18 @@ const ANTIGRAVITY_WIRE_MODEL_DISPLAY_NAMES = new Map<string, string>([
   ['gemini-3-flash-low', 'Gemini 3 Flash (Low)'],
 ])
 
-// Model-picker subset: `gemini-3-flash` stays fully ROUTABLE (it remains in
-// ANTIGRAVITY_MODELS / ANTIGRAVITY_MODEL_IDS so saved configs and explicit
-// --model flags keep working, with all cache discipline applied) but is
-// hidden from model selection — its serving channel commits the implicit
-// cache slowly (~40-50s vs 10-20s on 3.5-flash) and misses replicas often
-// (live-measured 64-71% vs 85-93% on 3.5-flash/Claude), so offering it in
-// the picker invites bad sessions for no capability gain.
+// Retired picker rows stay in the routing registry so saved sessions and
+// explicit model ids retain their executor, wire mapping and cache guards.
+// The picker offers Argon and 3.8 Flash; the original 3 Flash stays hidden.
+export function isHiddenAntigravityPickerModel(model: string): boolean {
+  const normalized = model.toLowerCase().replace(/^models\//, '')
+  return normalized === 'gemini-3-flash'
+    || /^gemini-3\.[567]-flash-(?:high|medium|low)$/.test(normalized)
+    || /^gemini-3\.1-pro-(?:high|low)$/.test(normalized)
+}
+
 export const ANTIGRAVITY_PICKER_MODELS: readonly ModelInfo[] =
-  ANTIGRAVITY_MODELS.filter(model => model.id !== 'gemini-3-flash')
+  ANTIGRAVITY_MODELS.filter(model => !isHiddenAntigravityPickerModel(model.id))
 
 /**
  * The picker's Claude rows for the account's plan. Paid Google AI Pro and
@@ -300,6 +306,9 @@ export function getAntigravityModelDisplayName(model: string): string | null {
 
 export function resolveAntigravityWireModel(model: string): string {
   const normalized = model.toLowerCase()
+  // Argon uses per-level ids; wrapForCodeAssist applies any explicit
+  // reasoning override and the tier-specific thinking wire format.
+  if (/^gemini-4-argon-(?:high|medium|low)$/.test(normalized)) return normalized
   // 3.6 and 3.8 keep their shared tiered wire models; the picker's level
   // rides in generationConfig.thinkingConfig.thinkingLevel.
   // 3.7 must preserve its per-level id: the daily endpoint returned 404 for
@@ -349,6 +358,8 @@ interface CodeAssistCache {
   version: number
   /** Antigravity project/entitlements belong to the credential that discovered them. */
   credentialKey?: string
+  /** Model availability also depends on the Hub client identity used at discovery. */
+  userAgent?: string
   projectId: string | null
   onboardedAt: number
   /**
@@ -451,13 +462,15 @@ export function describeAntigravityEntitlementGap(model: string): string | null 
   if (!entitled || entitled.length === 0) return null
 
   const entitledSet = new Set(entitled.map(id => id.toLowerCase()))
-  const wireModel = resolveAntigravityWireModel(normalized).toLowerCase()
-  if (entitledSet.has(normalized) || entitledSet.has(wireModel)) return null
+  const isEntitled = (id: string): boolean => entitledSet.has(id)
+    || entitledSet.has(resolveAntigravityWireModel(id).toLowerCase())
+    // Some capability lists advertise only High for the whole Argon family.
+    || (/^gemini-4-argon-(?:low|medium)$/.test(id) && entitledSet.has('gemini-4-argon-high'))
+  if (isEntitled(normalized)) return null
 
-  const alternatives = ANTIGRAVITY_MODELS
+  const alternatives = ANTIGRAVITY_PICKER_MODELS
     .map(candidate => candidate.id)
-    .filter(id =>
-      entitledSet.has(id) || entitledSet.has(resolveAntigravityWireModel(id).toLowerCase()))
+    .filter(isEntitled)
 
   return [
     `This Antigravity account is not entitled to ${normalized}.`,
@@ -526,7 +539,7 @@ function _cacheFileFor(executor: GeminiExecutor): string {
 function _readCache(executor: GeminiExecutor, credentialKey?: string): CodeAssistCache | null {
   const owner = credentialKey ?? _antigravityCredentialKey
   const matches = (cache: CodeAssistCache): boolean => executor === 'cli'
-    || (!!owner && cache.credentialKey === owner)
+    || (!!owner && cache.credentialKey === owner && cache.userAgent === ANTIGRAVITY_HUB_USER_AGENT)
   const mem = executor === 'cli' ? _cachedCli : _cachedAntigravity
   if (mem && matches(mem)) return mem
   try {
@@ -762,6 +775,7 @@ async function _ensureCodeAssistReady(
       // discovered project, paired with the token that started that request.
       if (epoch !== _antigravityCacheEpoch || credentialKey !== _antigravityCredentialKey) return
       cache.credentialKey = credentialKey
+      cache.userAgent = ANTIGRAVITY_HUB_USER_AGENT
     }
     _writeCache(executor, cache)
   }
@@ -1240,6 +1254,39 @@ export interface CodeAssistWrapperBody {
   request: Record<string, unknown>
 }
 
+function normalizeAntigravityArgonRequest(
+  model: string,
+  request: Record<string, unknown>,
+): string {
+  const match = model.match(/^gemini-4-argon-(low|medium|high)$/)
+  if (!match) return model
+  let tier = match[1]!
+  const generationConfig = request.generationConfig as Record<string, unknown> | undefined
+  const thinkingConfig = { ...(generationConfig?.thinkingConfig as Record<string, unknown> | undefined) }
+  const level = typeof thinkingConfig.thinkingLevel === 'string'
+    ? thinkingConfig.thinkingLevel.trim().toLowerCase() : ''
+  const budget = thinkingConfig.thinkingBudget
+  if (['none', 'minimal', 'low'].includes(level)) tier = 'low'
+  else if (level === 'medium') tier = 'medium'
+  else if (['high', 'xhigh', 'max'].includes(level)) tier = 'high'
+  else if (!level && typeof budget === 'number' && Number.isFinite(budget) && budget >= 0) {
+    tier = budget <= 1024 ? 'low' : budget <= 8192 ? 'medium' : 'high'
+  }
+
+  // Cloud Code accepts a level only on High; Low/Medium encode their level
+  // in the model id and require dynamic thinking. Keep includeThoughts as
+  // supplied. Clone both config layers so retries keep their original input.
+  // Protocol reference: router-for-me/CLIProxyAPI#6627.
+  delete thinkingConfig.thinkingBudget
+  if (tier === 'high') thinkingConfig.thinkingLevel = 'high'
+  else {
+    delete thinkingConfig.thinkingLevel
+    thinkingConfig.thinkingBudget = -1
+  }
+  request.generationConfig = { ...generationConfig, thinkingConfig }
+  return `gemini-4-argon-${tier}`
+}
+
 /**
  * Wrap a standard Gemini generateContent request body in the Code Assist
  * envelope shape.
@@ -1266,8 +1313,8 @@ export function wrapForCodeAssist(
   // Strip safetySettings — the Antigravity executor always removes them.
   // Also strip maxOutputTokens for non-Claude models (Antigravity executor
   // deletes request.generationConfig.maxOutputTokens for Gemini models).
-  const wireModel = resolveAntigravityWireModel(model)
   const request = { ...innerRequest }
+  const wireModel = normalizeAntigravityArgonRequest(resolveAntigravityWireModel(model), request)
   delete request.safetySettings
   const isClaude = wireModel.includes('claude')
   if (!isClaude) {

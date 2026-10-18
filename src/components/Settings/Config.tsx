@@ -30,6 +30,7 @@ import { Dialog } from '../design-system/Dialog.js';
 import { Select } from '../CustomSelect/index.js';
 import { OutputStylePicker } from '../OutputStylePicker.js';
 import { LanguagePicker } from '../LanguagePicker.js';
+import { SpinnerVerbsPicker } from '../SpinnerVerbsPicker.js';
 import { getExternalClaudeMdIncludes, getMemoryFiles, hasExternalClaudeMdIncludes } from 'src/utils/claudemd.js';
 import { KeyboardShortcutHint } from '../design-system/KeyboardShortcutHint.js';
 import { ConfigurableShortcutHint } from '../ConfigurableShortcutHint.js';
@@ -41,6 +42,7 @@ import { isSupportedTerminal, hasAccessToIDEExtensionDiffFeature } from '../../u
 import { getInitialSettings, getSettingsForSource, updateSettingsForSource } from '../../utils/settings/settings.js';
 import { getUserMsgOptIn, setUserMsgOptIn } from '../../bootstrap/state.js';
 import { DEFAULT_OUTPUT_STYLE_NAME } from 'src/constants/outputStyles.js';
+import { describeSpinnerVerbs } from '../../constants/spinnerVerbs.js';
 import { isEnvTruthy, isRunningOnHomespace } from 'src/utils/envUtils.js';
 import type { LocalJSXCommandContext, CommandResultDisplay } from '../../commands.js';
 import { getFeatureValue_CACHED_MAY_BE_STALE } from '../../services/analytics/growthbook.js';
@@ -52,13 +54,15 @@ import { useTerminalSize } from '../../hooks/useTerminalSize.js';
 import { clearFastModeCooldown, FAST_MODE_MODEL_DISPLAY, isFastModeAvailable, isFastModeEnabled, getFastModeModel, isFastModeSupportedByModel } from '../../utils/fastMode.js';
 import { isFullscreenEnvEnabled } from '../../utils/fullscreen.js';
 import { syncLspServerManagerWithSettings } from '../../services/lsp/manager.js';
+import { commitModelSwitch, restoreModelSnapshot } from '../../utils/hooks/commitModelSwitch.js';
+import { type EffortLevel, toPersistableEffort } from '../../utils/effort.js';
 type Props = {
   onClose: (result?: string, options?: {
     display?: CommandResultDisplay;
   }) => void;
   context: LocalJSXCommandContext;
   setTabsHidden: (hidden: boolean) => void;
-  onIsSearchModeChange?: (inSearchMode: boolean) => void;
+  onOwnsEscChange?: (ownsEsc: boolean) => void;
   contentHeight?: number;
 };
 type SettingBase = {
@@ -85,12 +89,12 @@ type Setting = (SettingBase & {
   onChange(value: string): void;
   type: 'managedEnum';
 });
-type SubMenu = 'Theme' | 'Model' | 'TeammateModel' | 'ExternalIncludes' | 'OutputStyle' | 'ChannelDowngrade' | 'Language' | 'EnableAutoUpdates';
+type SubMenu = 'Theme' | 'Model' | 'TeammateModel' | 'ExternalIncludes' | 'OutputStyle' | 'ChannelDowngrade' | 'Language' | 'SpinnerVerbs' | 'EnableAutoUpdates';
 export function Config({
   onClose,
   context,
   setTabsHidden,
-  onIsSearchModeChange,
+  onOwnsEscChange,
   contentHeight
 }: Props): React.ReactNode {
   const {
@@ -141,6 +145,9 @@ export function Config({
   const [changes, setChanges] = useState<{
     [key: string]: unknown;
   }>({});
+  const [modelSwitchError, setModelSwitchError] = useState<string | undefined>();
+  const pendingModelSelection = React.useRef(0);
+  React.useEffect(() => () => { pendingModelSelection.current++; }, []);
   const initialThinkingEnabled = React.useRef(thinkingEnabled);
   // Per-source settings snapshots for revert-on-escape. getInitialSettings()
   // returns merged-across-sources which can't tell us what to delete vs
@@ -158,6 +165,7 @@ export function Config({
     return {
       mainLoopModel: s_4.mainLoopModel,
       mainLoopModelForSession: s_4.mainLoopModelForSession,
+      effortValue: s_4.effortValue,
       verbose: s_4.verbose,
       thinkingEnabled: s_4.thinkingEnabled,
       fastMode: s_4.fastMode,
@@ -192,29 +200,50 @@ export function Config({
     passthroughCtrlKeys: ['c', 'd']
   });
 
-  // Tell the parent when Config's own Esc handler is active so Settings cedes
-  // confirm:no. Only true when search mode owns the keyboard — not when the
-  // tab header is focused (then Settings must handle Esc-to-close).
-  const ownsEsc = isSearchMode && !headerFocused;
+  // Tell the parent Config handles Esc itself so Settings cedes confirm:no:
+  // search mode clears and leaves the search, the list undoes every change
+  // and closes, a submenu handles its own. Settings only takes Esc while the
+  // tab header is focused. Both active at once is a race the first-registered
+  // handler wins, and on the first /config of a session Config registers after
+  // Settings (it suspends on memory files), so Esc closed without undoing.
+  const ownsEsc = !headerFocused;
   React.useEffect(() => {
-    onIsSearchModeChange?.(ownsEsc);
-  }, [ownsEsc, onIsSearchModeChange]);
+    onOwnsEscChange?.(ownsEsc);
+  }, [ownsEsc, onOwnsEscChange]);
   const isConnectedToIde = hasAccessToIDEExtensionDiffFeature(context.options.mcpClients);
   const isFileCheckpointingAvailable = !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING);
   const memoryFiles = React.use(getMemoryFiles(true));
   const shouldShowExternalIncludesToggle = hasExternalClaudeMdIncludes(memoryFiles);
   const autoUpdaterDisabledReason = getAutoUpdaterDisabledReason();
-  function onChangeMainModelConfig(value: string | null): void {
-    const previousModel = mainLoopModel;
+  async function onChangeMainModelConfig(value: string | null, effort?: EffortLevel, commitSelection?: () => void): Promise<void> {
+    const selection = ++pendingModelSelection.current;
+    setModelSwitchError(undefined);
+    const previousModel = store.getState().mainLoopModel;
+    const decision = await commitModelSwitch({
+      model: value, source: 'picker', context,
+      isActive: () => pendingModelSelection.current === selection,
+      onMessages: messages => context.setMessages(previous => [...previous, ...messages]),
+      commit: () => {
+        isDirty.current = true;
+        commitSelection?.();
+        const persistableEffort = effort === undefined ? undefined : toPersistableEffort(effort);
+        if (!commitSelection && persistableEffort !== undefined) updateSettingsForSource('userSettings', { effortLevel: persistableEffort });
+        setAppState(prev => ({
+          ...prev,
+          mainLoopModel: value,
+          mainLoopModelForSession: null,
+          ...(effort !== undefined ? { effortValue: effort } : {}),
+        }));
+      },
+    });
+    if (!decision.allowed) {
+      setModelSwitchError(decision.reason);
+      return;
+    }
     logEvent('tengu_config_model_changed', {
       from_model: previousModel as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
       to_model: value as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
     });
-    setAppState(prev => ({
-      ...prev,
-      mainLoopModel: value,
-      mainLoopModelForSession: null
-    }));
     setChanges(prev_0 => {
       const valStr = modelDisplayString(value) + (isBilledAsExtraUsage(value, false, isOpus1mMergeEnabled()) ? ' · Billed as extra usage' : '');
       if ('model' in prev_0) {
@@ -318,6 +347,12 @@ export function Config({
       });
     }
   }, {
+    id: 'spinnerVerbs',
+    label: 'Spinner verbs',
+    value: describeSpinnerVerbs(settingsData?.spinnerVerbs),
+    type: 'managedEnum' as const,
+    onChange: () => {} // handled by SpinnerVerbsPicker submenu
+  }, {
     id: 'inlineImagesEnabled',
     label: 'Display images',
     value: settingsData?.inlineImagesEnabled ?? true,
@@ -343,6 +378,32 @@ export function Config({
       }));
       logEvent('tengu_inline_images_setting_changed', {
         enabled: inlineImagesEnabled
+      });
+    }
+  }, {
+    id: 'inlineImagesAnimated',
+    label: 'Animate images',
+    value: settingsData?.inlineImagesAnimated ?? true,
+    type: 'boolean' as const,
+    onChange(inlineImagesAnimated: boolean) {
+      updateSettingsForSource('localSettings', {
+        inlineImagesAnimated
+      });
+      setSettingsData(prev_anim => ({
+        ...prev_anim,
+        inlineImagesAnimated
+      }));
+      // Mirrored for the same reason as Display images: a GIF playing on
+      // screen stops on this frame, not at the next settings-file poll.
+      setAppState(prev_anim_state => ({
+        ...prev_anim_state,
+        settings: {
+          ...prev_anim_state.settings,
+          inlineImagesAnimated
+        }
+      }));
+      logEvent('tengu_inline_images_animated_setting_changed', {
+        enabled: inlineImagesAnimated
       });
     }
   }, {
@@ -432,33 +493,32 @@ export function Config({
     label: `Fast mode (${FAST_MODE_MODEL_DISPLAY} only)`,
     value: !!isFastMode,
     type: 'boolean' as const,
-    onChange(enabled_0: boolean) {
-      clearFastModeCooldown();
-      updateSettingsForSource('userSettings', {
-        fastMode: enabled_0 ? true : undefined
-      });
+    async onChange(enabled_0: boolean) {
       if (enabled_0) {
-        setAppState(prev_7 => ({
-          ...prev_7,
-          mainLoopModel: getFastModeModel(),
-          mainLoopModelForSession: null,
-          fastMode: true
-        }));
-        setChanges(prev_8 => ({
-          ...prev_8,
-          model: getFastModeModel(),
-          'Fast mode': 'ON'
-        }));
-      } else {
-        setAppState(prev_9 => ({
-          ...prev_9,
-          fastMode: false
-        }));
-        setChanges(prev_10 => ({
-          ...prev_10,
-          'Fast mode': 'OFF'
-        }));
+        const selection = ++pendingModelSelection.current;
+        const decision = await commitModelSwitch({
+          model: getFastModeModel(), source: 'picker', context,
+          isActive: () => pendingModelSelection.current === selection,
+          onMessages: messages => context.setMessages(previous => [...previous, ...messages]),
+          commit: () => {
+            clearFastModeCooldown();
+            updateSettingsForSource('userSettings', { fastMode: true });
+            setAppState(prev => ({ ...prev, mainLoopModel: getFastModeModel(), mainLoopModelForSession: null, fastMode: true }));
+          },
+        });
+        if (!decision.allowed) {
+          setModelSwitchError(decision.reason);
+          return;
+        }
+        setModelSwitchError(undefined);
+        setChanges(prev => ({ ...prev, model: getFastModeModel(), 'Fast mode': 'ON' }));
+        return;
       }
+      pendingModelSelection.current++;
+      clearFastModeCooldown();
+      updateSettingsForSource('userSettings', { fastMode: undefined });
+      setAppState(prev => ({ ...prev, fastMode: false }));
+      setChanges(prev => ({ ...prev, 'Fast mode': 'OFF' }));
     }
   }] : []), ...(getFeatureValue_CACHED_MAY_BE_STALE('tengu_chomp_inflection', false) ? [{
     id: 'promptSuggestionEnabled',
@@ -1271,6 +1331,10 @@ export function Config({
     if (settingsData?.autoUpdatesChannel !== initialSettingsData.current?.autoUpdatesChannel) {
       formattedChanges.push(`Set auto-update channel to ${chalk.bold(settingsData?.autoUpdatesChannel ?? 'latest')}`);
     }
+    const spinnerVerbsLabel = describeSpinnerVerbs(settingsData?.spinnerVerbs);
+    if (spinnerVerbsLabel !== describeSpinnerVerbs(initialSettingsData.current?.spinnerVerbs)) {
+      formattedChanges.push(`Set spinner verbs to ${chalk.bold(spinnerVerbsLabel)}`);
+    }
     if (formattedChanges.length > 0) {
       onClose(formattedChanges.join('\n'));
     } else {
@@ -1278,12 +1342,30 @@ export function Config({
         display: 'system'
       });
     }
-  }, [showSubmenu, changes, globalConfig, mainLoopModel, currentOutputStyle, currentLanguage, settingsData?.autoUpdatesChannel, settingsData?.lspEnabled, isFastModeEnabled() ? (settingsData as Record<string, unknown> | undefined)?.fastMode : undefined, onClose]);
+  }, [showSubmenu, changes, globalConfig, mainLoopModel, currentOutputStyle, currentLanguage, settingsData?.autoUpdatesChannel, settingsData?.lspEnabled, settingsData?.spinnerVerbs, isFastModeEnabled() ? (settingsData as Record<string, unknown> | undefined)?.fastMode : undefined, onClose]);
 
   // Restore all state stores to their mount-time snapshots. Changes are
   // applied to disk/AppState immediately on toggle, so "cancel" means
   // actively writing the old values back.
-  const revertChanges = useCallback(() => {
+  const revertChanges = useCallback(async () => {
+    const selection = pendingModelSelection.current;
+    const ia = initialAppState;
+    const decision = await restoreModelSnapshot({
+      snapshot: {
+        mainLoopModel: ia.mainLoopModel,
+        mainLoopModelForSession: ia.mainLoopModelForSession,
+        fastMode: ia.fastMode,
+        effortValue: ia.effortValue,
+      },
+      context,
+      isActive: () => pendingModelSelection.current === selection,
+      onMessages: messages => context.setMessages(previous => [...previous, ...messages]),
+      commitSettings: () => updateSettingsForSource('userSettings', {
+        fastMode: initialUserSettings?.fastMode,
+        effortLevel: initialUserSettings?.effortLevel,
+      }),
+    });
+    if (pendingModelSelection.current !== selection) return 'Config cancellation superseded';
     // Theme: restores ThemeProvider React state. Must run before the global
     // config overwrite since setTheme internally calls saveGlobalConfig with
     // a partial update — we want the full snapshot to be the last write.
@@ -1300,6 +1382,9 @@ export function Config({
     updateSettingsForSource('localSettings', {
       spinnerTipsEnabled: il?.spinnerTipsEnabled,
       lspEnabled: il?.lspEnabled,
+      inlineImagesEnabled: il?.inlineImagesEnabled,
+      inlineImagesAnimated: il?.inlineImagesAnimated,
+      mermaidDiagrams: il?.mermaidDiagrams,
       prefersReducedMotion: il?.prefersReducedMotion,
       defaultView: il?.defaultView,
       outputStyle: il?.outputStyle
@@ -1308,11 +1393,11 @@ export function Config({
     const iu = initialUserSettings;
     updateSettingsForSource('userSettings', {
       alwaysThinkingEnabled: iu?.alwaysThinkingEnabled,
-      fastMode: iu?.fastMode,
       promptSuggestionEnabled: iu?.promptSuggestionEnabled,
       autoUpdatesChannel: iu?.autoUpdatesChannel,
       minimumVersion: iu?.minimumVersion,
       language: iu?.language,
+      spinnerVerbs: iu?.spinnerVerbs,
       ...(feature('TRANSCRIPT_CLASSIFIER') ? {
         useAutoModeDuringPlan: (iu as {
           useAutoModeDuringPlan?: boolean;
@@ -1333,19 +1418,20 @@ export function Config({
       }
     });
     // AppState: batch-restore all possibly-touched fields.
-    const ia = initialAppState;
     setAppState(prev_23 => ({
       ...prev_23,
-      mainLoopModel: ia.mainLoopModel,
-      mainLoopModelForSession: ia.mainLoopModelForSession,
       verbose: ia.verbose,
       thinkingEnabled: ia.thinkingEnabled,
-      fastMode: ia.fastMode,
       promptSuggestionEnabled: ia.promptSuggestionEnabled,
       isBriefOnly: ia.isBriefOnly,
       replBridgeEnabled: ia.replBridgeEnabled,
       replBridgeOutboundOnly: ia.replBridgeOutboundOnly,
-      settings: ia.settings,
+      settings: decision.allowed ? ia.settings : {
+        ...ia.settings,
+        model: prev_23.settings.model,
+        fastMode: prev_23.settings.fastMode,
+        effortLevel: prev_23.settings.effortLevel,
+      },
       // Reconcile auto-mode state after useAutoModeDuringPlan revert above —
       // the onChange handler may have activated/deactivated auto mid-plan.
       toolPermissionContext: transitionPlanAutoMode(prev_23.toolPermissionContext)
@@ -1356,17 +1442,18 @@ export function Config({
     if (getUserMsgOptIn() !== initialUserMsgOptIn) {
       setUserMsgOptIn(initialUserMsgOptIn);
     }
-  }, [themeSetting, setTheme, initialLocalSettings, initialUserSettings, initialAppState, initialUserMsgOptIn, setAppState]);
+    return decision.allowed ? undefined : decision.reason;
+  }, [themeSetting, setTheme, initialLocalSettings, initialUserSettings, initialAppState, initialUserMsgOptIn, setAppState, context]);
 
   // Escape: revert all changes (if any) and close.
-  const handleEscape = useCallback(() => {
+  const handleEscape = useCallback(async () => {
+    const selection = ++pendingModelSelection.current;
     if (showSubmenu !== null) {
       return;
     }
-    if (isDirty.current) {
-      revertChanges();
-    }
-    onClose('Config dialog dismissed', {
+    const blocked = isDirty.current ? await revertChanges() : undefined;
+    if (pendingModelSelection.current !== selection) return;
+    onClose(blocked ? `Config dialog dismissed. Model rollback blocked: ${blocked}` : 'Config dialog dismissed', {
       display: 'system'
     });
   }, [showSubmenu, revertChanges, onClose]);
@@ -1406,7 +1493,7 @@ export function Config({
       }
       return;
     }
-    if (setting_0.id === 'theme' || setting_0.id === 'model' || setting_0.id === 'teammateDefaultModel' || setting_0.id === 'showExternalIncludesDialog' || setting_0.id === 'outputStyle' || setting_0.id === 'language') {
+    if (setting_0.id === 'theme' || setting_0.id === 'model' || setting_0.id === 'teammateDefaultModel' || setting_0.id === 'showExternalIncludesDialog' || setting_0.id === 'outputStyle' || setting_0.id === 'language' || setting_0.id === 'spinnerVerbs') {
       // managedEnum items open a submenu — isDirty is set by the submenu's
       // completion callback, not here (submenu may be cancelled).
       switch (setting_0.id) {
@@ -1432,6 +1519,10 @@ export function Config({
           return;
         case 'language':
           setShowSubmenu('Language');
+          setTabsHidden(true);
+          return;
+        case 'spinnerVerbs':
+          setShowSubmenu('SpinnerVerbs');
           setTabsHidden(true);
           return;
       }
@@ -1560,6 +1651,7 @@ export function Config({
     }
   }, [showSubmenu, headerFocused, isSearchMode, searchQuery, setSearchQuery, toggleSetting]);
   return <Box flexDirection="column" width="100%" tabIndex={0} autoFocus onKeyDown={handleKeyDown}>
+      {modelSwitchError && <Text color="error">{modelSwitchError}</Text>}
       {showSubmenu === 'Theme' ? <>
           <ThemePicker onThemeSelect={setting_1 => {
         isDirty.current = true;
@@ -1580,9 +1672,8 @@ export function Config({
             </Text>
           </Box>
         </> : showSubmenu === 'Model' ? <>
-          <ModelPicker initial={mainLoopModel} onSelect={(model_0, _effort) => {
-        isDirty.current = true;
-        onChangeMainModelConfig(model_0);
+          <ModelPicker initial={mainLoopModel} deferSelectionEffects onSelect={(model_0, effort, commitSelection) => {
+        void onChangeMainModelConfig(model_0, effort, commitSelection);
         setShowSubmenu(null);
         setTabsHidden(false);
       }} onCancel={() => {
@@ -1691,6 +1782,32 @@ export function Config({
             <Byline>
               <KeyboardShortcutHint shortcut="Enter" action="confirm" />
               <ConfigurableShortcutHint action="confirm:no" context="Settings" fallback="Esc" description="cancel" />
+            </Byline>
+          </Text>
+        </> : showSubmenu === 'SpinnerVerbs' ? <>
+          <SpinnerVerbsPicker initial={settingsData?.spinnerVerbs} onComplete={spinnerVerbs => {
+        setShowSubmenu(null);
+        setTabsHidden(false);
+
+        // Save to user settings so the choice applies in every project.
+        // undefined (On) deletes the key and brings back the built-in verbs.
+        const result = updateSettingsForSource('userSettings', {
+          spinnerVerbs
+        });
+        if (result.error) {
+          logError(result.error);
+          return;
+        }
+        isDirty.current = true;
+        setSettingsData(getInitialSettings());
+      }} onCancel={() => {
+        setShowSubmenu(null);
+        setTabsHidden(false);
+      }} />
+          <Text dimColor>
+            <Byline>
+              <KeyboardShortcutHint shortcut="Enter" action="confirm" />
+              <ConfigurableShortcutHint action="select:cancel" context="Select" fallback="Esc" description="cancel" />
             </Byline>
           </Text>
         </> : showSubmenu === 'EnableAutoUpdates' ? <Dialog title="Enable Auto-Updates" onCancel={() => {

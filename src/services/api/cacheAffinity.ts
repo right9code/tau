@@ -32,6 +32,14 @@ const STABLE_REQUEST_SESSION_PROVIDERS = new Set<string>([
   // Cline lane sends this id there so the gateway sees one task per session.
   'cline',
   'clinepass',
+  // xAI caches per server. This id is both `prompt_cache_key` and the
+  // `x-grok-conv-id` header, which pin a conversation to the server holding
+  // its cache, and it keys the lane's frozen environment block.
+  'xai',
+  // Meta routes its cache by a key naming the shared prefix, not the session
+  // (per-session keys lower its hit rate); this id keys the lane's frozen
+  // environment block and per-conversation tool order.
+  'meta',
 ])
 
 /**
@@ -51,13 +59,19 @@ export function providerUsesStableRequestSession(provider: string): boolean {
  * ordinary agent needs a session of its own (resolveProviderRequestSessionId).
  * Mistral freezes system/tools by it. DeepSeek, GLM, Moonshot and MiniMax
  * freeze the environment block (working directory, git status, memory) by it.
+ * Copilot uses it for cache/gateway affinity and sticky ToolSearch loads.
+ * xAI freezes the environment block and its tool order by it, and routes the
+ * cache with it. Meta freezes the same two by it.
  */
 const PER_AGENT_SESSION_PROVIDERS = new Set<string>([
+  'copilot',
   'mistral',
   'deepseek',
   'glm',
   'moonshot',
   'minimax',
+  'xai',
+  'meta',
 ])
 
 function usesRootProviderSession(querySource: QuerySource): boolean {

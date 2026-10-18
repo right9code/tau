@@ -45,7 +45,7 @@ import type {
   AnthropicMessage,
   ProviderStreamResult,
 } from './base_provider.js'
-import { OpenAIProvider } from './openai_provider.js'
+import { CompatChatProvider } from './compat_chat_provider.js'
 import { CommandCodeProvider } from './commandcode_provider.js'
 import { GeminiProvider } from './gemini_provider.js'
 import { OpenRouterProvider } from './openrouter_provider.js'
@@ -160,6 +160,10 @@ function _ensureLanesInitialized(): void {
       fireworksBaseUrl: getProviderBaseUrl('fireworks'),
       cloudflareApiKey: getProviderApiKey('cloudflare') ?? undefined,
       cloudflareBaseUrl: getProviderBaseUrl('cloudflare'),
+      xaiApiKey: getProviderApiKey('xai') ?? undefined,
+      xaiBaseUrl: getProviderBaseUrl('xai'),
+      metaApiKey: getProviderApiKey('meta') ?? undefined,
+      metaBaseUrl: getProviderBaseUrl('meta'),
       qwenApiKey: process.env.DASHSCOPE_API_KEY ?? process.env.QWEN_API_KEY,
       iflowApiKey: iflowChatKey,
       kilocodeApiKey: kilocodeToken,
@@ -212,6 +216,11 @@ function _laneNameForProvider(provider: APIProvider): string {
     case 'mimo':
     case 'fireworks':
     case 'cloudflare':
+    // xAI rides the compat lane's provider registry; its requests go out on
+    // the Responses API (lanes/openai-compat/xai_responses.ts).
+    case 'xai':
+    // Meta likewise (lanes/openai-compat/meta_responses.ts).
+    case 'meta':
       return 'openai-compat'
     case 'cline':
     case 'clinepass':
@@ -376,7 +385,7 @@ function createProvider(provider: APIProvider): BaseProvider {
     case 'opencodego':
     case 'fireworks':
     case 'cloudflare':
-      return new OpenAIProvider({ apiKey, baseUrl })
+      return new CompatChatProvider(provider, { apiKey, baseUrl })
     case 'lxd':
       return new LxdProvider({ apiKey, baseUrl })
     case 'mimo':
@@ -392,6 +401,20 @@ function createProvider(provider: APIProvider): BaseProvider {
         'Mistral chat requires the openai-compat lane to be healthy. '
         + 'Run `/login` to authenticate, or check that MISTRAL_API_KEY is set.',
       )
+    case 'xai':
+      // xAI has no legacy chat path: Chat Completions is deprecated there and
+      // drops the reasoning its prompt cache needs.
+      throw new Error(
+        'xAI requires the openai-compat lane to be healthy. '
+        + 'Run `/login xai` to authenticate, or check that XAI_API_KEY is set.',
+      )
+    case 'meta':
+      // Meta has no legacy chat path: its Chat Completions route does not
+      // carry reasoning across turns for external keys.
+      throw new Error(
+        'Meta requires the openai-compat lane to be healthy. '
+        + 'Run `/login meta` to authenticate, or check that META_API_KEY is set.',
+      )
     case 'nim':
       return new NimProvider({ apiKey, baseUrl })
     case 'deepseek':
@@ -405,7 +428,7 @@ function createProvider(provider: APIProvider): BaseProvider {
     case 'ollama':
       return new OllamaProvider({ apiKey, baseUrl })
     case 'lmstudio':
-      return new OpenAIProvider({ apiKey: apiKey || 'lm-studio', baseUrl })
+      return new CompatChatProvider(provider, { apiKey: apiKey || 'lm-studio', baseUrl })
     // Phase 4 / Phase 5 OAuth-compat providers: they're expected to reach
     // the openai-compat lane above. If we got here, the lane is unhealthy
     // (missing creds or the register step failed) — surface a useful
@@ -882,6 +905,8 @@ export async function reloadOpenAICompatProviderAuth(provider: APIProvider): Pro
     case 'alibaba':
     case 'fireworks':
     case 'cloudflare':
+    case 'xai':
+    case 'meta':
     case 'groq':
     case 'ollama':
     case 'lmstudio':

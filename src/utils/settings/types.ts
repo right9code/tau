@@ -686,7 +686,7 @@ export const SettingsSchema = lazySchema(() =>
         })
         .optional()
         .describe(
-          'Customize spinner verbs. mode: "append" adds verbs to defaults, "replace" uses only your verbs.',
+          'Customize spinner verbs. mode: "append" adds verbs to defaults, "replace" uses only your verbs (the line after each turn then says "Worked"). Also set in /config under Spinner verbs.',
         ),
       spinnerTipsOverride: z
         .object({
@@ -702,6 +702,12 @@ export const SettingsSchema = lazySchema(() =>
         .optional()
         .describe(
           'Whether to render images inline in the transcript (defaults to true). Set to false to show only the summary line.',
+        ),
+      inlineImagesAnimated: z
+        .boolean()
+        .optional()
+        .describe(
+          'Whether animated GIF and WebP images play in the transcript (defaults to true). Only applies while inlineImagesEnabled is on; set to false, or turn on prefersReducedMotion, to show the first frame only.',
         ),
       mermaidDiagrams: z
         .boolean()

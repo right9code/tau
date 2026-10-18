@@ -48,6 +48,8 @@ import {
   OpenCodeResponsesStream,
 } from './opencode_responses.js'
 import { readSseDataPayloads } from './sse_payloads.js'
+import { listXaiModels, streamXaiResponses } from './xai_responses.js'
+import { listMetaModels, streamMetaResponses } from './meta_responses.js'
 import { recordCompatCacheDebug } from './cache_debug.js'
 import { beginMistralCacheDebug } from './mistral_cache_debug.js'
 import {
@@ -158,6 +160,8 @@ type ProviderType =
   | 'iflow'
   | 'kilocode'
   | 'copilot'
+  | 'xai'
+  | 'meta'
   | 'generic'
 
 function detectProvider(model: string, baseUrl: string): ProviderType {
@@ -192,6 +196,8 @@ function detectProvider(model: string, baseUrl: string): ProviderType {
   if (b.includes('iflow.cn') || b.includes('apis.iflow')) return 'iflow'
   if (b.includes('kilocode.ai') || b.includes('kilo.ai')) return 'kilocode'
   if (b.includes('githubcopilot.com')) return 'copilot'
+  if (b.includes('api.x.ai')) return 'xai'
+  if (b.includes('api.meta.ai')) return 'meta'
   if (m.startsWith('@cf/')) return 'cloudflare'
   if (m.includes('deepseek')) return 'deepseek'
   if (m.startsWith('glm-')) return 'glm'
@@ -491,6 +497,20 @@ export class OpenAICompatLane implements Lane {
       ? sessionId
       : undefined
 
+    // xAI runs on its Responses API (xai_responses.ts): its Chat Completions
+    // route is deprecated and cannot carry the encrypted reasoning that the
+    // xAI prompt cache needs replayed.
+    if (provider === 'xai') {
+      return yield* streamXaiResponses(cfg, { ...params, model }, cacheSessionId)
+    }
+
+    // Meta (Muse) runs on its Responses API (meta_responses.ts), the one Meta
+    // recommends for agents: its Chat Completions route does not carry
+    // reasoning across turns for external keys.
+    if (provider === 'meta') {
+      return yield* streamMetaResponses(cfg, { ...params, model }, cacheSessionId)
+    }
+
     // OpenCode Zen/Go: each row goes to the gateway route the official client
     // uses for it (opencode_anthropic_route.ts). The gateway forwards bodies
     // untouched and 500s on a route that does not match the row's upstream,
@@ -514,6 +534,7 @@ export class OpenAICompatLane implements Lane {
         stop_sequences,
         signal,
         thinking,
+        effortValue: params.effortValue,
       }
       if (route === 'messages') {
         return yield* streamOpenCodeAnthropicRoute(provider, cfg, routeParams, cacheSessionId)
@@ -659,6 +680,7 @@ export class OpenAICompatLane implements Lane {
       provider,
       thinking,
       cacheSessionId,
+      params.effortValue,
     )
 
     if (provider === 'openrouter' && openRouterRecovery) {
@@ -1393,6 +1415,8 @@ export class OpenAICompatLane implements Lane {
     const entries = Array.from(this.configs.entries())
       .filter(([name]) => !providerFilter || name === providerFilter)
     const results = await Promise.allSettled(entries.map(async ([providerName, cfg]) => {
+      if (providerName === 'xai') return listXaiModels(cfg)
+      if (providerName === 'meta') return listMetaModels(cfg)
       if (isDirectProvider(providerName)) {
         return listDirectProviderModels(providerName, cfg.baseUrl, { Authorization: `Bearer ${cfg.apiKey}`, Accept: 'application/json' })
       }
@@ -1888,6 +1912,7 @@ type OpenCodeRouteParams = Pick<
   LaneProviderCallParams,
   'model' | 'messages' | 'system' | 'tools' | 'max_tokens'
   | 'temperature' | 'stop_sequences' | 'signal' | 'thinking'
+  | 'effortValue'
 >
 
 /** The session's own thinking level, when its thinking is on. */
@@ -1993,12 +2018,13 @@ function applyOpenCodeAnthropicThinking(
   provider: string,
   model: string,
   sessionEffort: 'low' | 'medium' | 'high' | null,
+  effortValue?: LaneProviderCallParams['effortValue'],
 ): void {
   const id = model.trim().toLowerCase()
   let budget: number
   if (id.startsWith('claude-')) {
     delete body.temperature
-    const effort = resolveOpencodeRouteEffort(provider, model, sessionEffort)
+    const effort = resolveOpencodeRouteEffort(provider, model, sessionEffort, effortValue)
     if (!effort) return
     const kind = claudeThinkingKind(id)
     if (kind !== 'budget') {
@@ -2016,7 +2042,7 @@ function applyOpenCodeAnthropicThinking(
     body.thinking = { type: 'adaptive' }
     return
   } else if (usesOpencodeCatalogEfforts(provider, model)) {
-    const effort = resolveOpencodeRouteEffort(provider, model, sessionEffort)
+    const effort = resolveOpencodeRouteEffort(provider, model, sessionEffort, effortValue)
     if (effort) body.output_config = { effort }
     return
   } else {
@@ -2024,7 +2050,7 @@ function applyOpenCodeAnthropicThinking(
     // (supportsOpencodeThinkingSelection is false there) and keeps its
     // server default.
     if (!supportsOpencodeThinkingSelection(provider, model)) return
-    const effort = getOpencodeEffort(model, provider)
+    const effort = getOpencodeEffort(model, provider, effortValue)
     if (effort === 'default') return
     budget = legacyThinkingBudget(effort)
   }
@@ -2117,7 +2143,8 @@ async function* streamOpenCodeAnthropicRoute(
   if (params.tools.length > 0) body.tools = params.tools
   if (params.temperature !== undefined) body.temperature = params.temperature
   if (params.stop_sequences?.length) body.stop_sequences = params.stop_sequences
-  applyOpenCodeAnthropicThinking(body, provider, params.model, sessionEffortOf(params.thinking))
+  applyOpenCodeAnthropicThinking(body, provider, params.model,
+    params.effortValue === undefined ? sessionEffortOf(params.thinking) : null, params.effortValue)
 
   // `/messages` authenticates with x-api-key. Keep the same OpenCode
   // affinity/rate-limit headers as the compat route.
@@ -2382,7 +2409,8 @@ async function* streamOpenCodeResponsesRoute(
     maxTokens: params.max_tokens,
     temperature: params.temperature,
     sessionId,
-    effort: resolveOpencodeRouteEffort(provider, params.model, sessionEffortOf(params.thinking)),
+    effort: resolveOpencodeRouteEffort(provider, params.model,
+      params.effortValue === undefined ? sessionEffortOf(params.thinking) : null, params.effortValue),
     canSeeImages: openCodeRouteCanSeeImages(provider, params.model),
   })
   return yield* runOpenCodeRouteStream(
@@ -2409,7 +2437,8 @@ async function* streamOpenCodeGoogleRoute(
     maxTokens: params.max_tokens,
     temperature: params.temperature,
     stopSequences: params.stop_sequences,
-    effort: resolveOpencodeRouteEffort(provider, params.model, sessionEffortOf(params.thinking)),
+    effort: resolveOpencodeRouteEffort(provider, params.model,
+      params.effortValue === undefined ? sessionEffortOf(params.thinking) : null, params.effortValue),
     canSeeImages: openCodeRouteCanSeeImages(provider, params.model),
   })
   // Google's format takes the key in x-goog-api-key, next to the same
@@ -2994,6 +3023,7 @@ function applyProviderRequestQuirks(
   provider: ProviderType,
   thinking: LaneProviderCallParams['thinking'] | undefined,
   sessionId?: string,
+  effortValue?: LaneProviderCallParams['effortValue'],
 ): OpenAIChatRequest {
   const transformer = getTransformer(provider as ProviderId)
   const isReasoning = !!(thinking && thinking.type !== 'disabled')
@@ -3024,6 +3054,7 @@ function applyProviderRequestQuirks(
     model: body.model,
     isReasoning,
     reasoningEffort: effort,
+    effortValue,
     sessionId,
     provider,
   })

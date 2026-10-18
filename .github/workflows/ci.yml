@@ -59,6 +59,8 @@ jobs:
                 ;;
               Windows)
                 pwsh -NoProfile -File .github/scripts/ensure-ripgrep.ps1
+                # A child PowerShell cannot update this Bash process's PATH.
+                export PATH="$PWD/dist/vendor/ripgrep/$(node -p process.arch)-win32:$PATH"
                 ;;
               *)
                 echo "Unsupported runner OS: $RUNNER_OS" >&2
@@ -111,14 +113,20 @@ jobs:
       - name: Build with esbuild (default, Node-only)
         run: npm run build
 
+      - name: Test Bash working directory persistence and provider adapters
+        run: node --test test/bash-cwd-persistence.test.mjs
+
       - name: Test source-map reads and cache stability
-        run: node --test test/file-read-source-maps.test.mjs test/core-tool-contracts.test.mjs test/tool-result-budget.test.mjs
+        run: node --test test/file-read-source-maps.test.mjs test/file-read-range-dedup.test.mjs test/core-tool-contracts.test.mjs test/tool-result-budget.test.mjs
 
       - name: Test memory index reminders
         run: node --test test/memory-index-guard.test.mjs test/memory-index-tool-results.test.mjs
 
       - name: Test OpenAI effort settings, request routing, and cache stability
         run: node --test test/openai-effort.test.mjs test/openai-native-routing.test.mjs test/openai-websocket.test.mjs test/openai-reasoning-normalization.test.mjs test/openai-reasoning-transport.test.mjs test/openai-agent-completion.test.mjs test/openai-prompt-suggestions.test.mjs test/openai-cache-diagnostics.test.mjs test/openai-turn-state.test.mjs test/openai-turn-lifecycle.test.mjs
+
+      - name: Test provider effort inheritance and cache stability
+        run: node --test test/provider-effort.test.mjs
 
       - name: Test ToolSearch wording and the environment block's folder
         run: node --test test/tool-search-wording.test.mjs test/env-working-directory.test.mjs
@@ -139,6 +147,9 @@ jobs:
 
       - name: Test foreground agent cancellation and background handoff
         run: node --test test/foreground-agent-cancellation.test.mjs
+
+      - name: Test waiting on background tasks and the polling guard
+        run: node --test test/background-wait-loop.test.mjs
 
       - name: Test plugin update marketplace refresh with local Git remotes
         run: node --test test/plugin-update-marketplace-refresh.test.mjs

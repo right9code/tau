@@ -31,6 +31,12 @@ import {
 import { openBrowser } from '../utils/browser.js'
 import TextInput from './TextInput.js'
 import { alibabaBaseUrl } from '../utils/model/alibabaCatalog.js'
+import {
+  checkXaiApiKey,
+  validateXaiManagementKey,
+  xaiKeyBlockReason,
+} from '../services/api/xaiAccount.js'
+import { checkMetaApiKey, META_DASHBOARD_URL, metaBaseUrlFromEnv } from '../services/api/metaAccount.js'
 
 // ─── Provider metadata ───────────────────────────────────────────
 
@@ -118,6 +124,19 @@ const PROVIDER_META: Partial<Record<APIProvider, ProviderMeta>> = {
   alibaba: {
     envVar: 'DASHSCOPE_API_KEY',
     getKeyUrl: 'https://modelstudio.console.alibabacloud.com/?tab=playground#/api-key',
+    supportsOAuth: false,
+  },
+  xai: {
+    envVar: 'XAI_API_KEY',
+    keyPrefix: 'xai-',
+    getKeyUrl: 'https://console.x.ai/team/default/api-keys',
+    supportsOAuth: false,
+  },
+  meta: {
+    envVar: 'META_API_KEY',
+    keyPrefix: 'LLM_',
+    // Model API dashboard → API keys → Create API key.
+    getKeyUrl: META_DASHBOARD_URL,
     supportsOAuth: false,
   },
   fireworks: {
@@ -236,6 +255,31 @@ async function _testApiKey(
   options: { cloudflareAccountId?: string } = {},
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
+    if (provider === 'xai') {
+      // GET /v1/api-key describes the key itself, so it also catches a key
+      // that authenticates but cannot run requests (blocked key or team).
+      const result = await checkXaiApiKey(key, process.env.XAI_BASE_URL ?? 'https://api.x.ai/v1')
+      if (result.ok) {
+        const blocked = xaiKeyBlockReason(result.info)
+        return blocked ? { ok: false, error: `xAI accepted the key, but ${blocked}.` } : { ok: true }
+      }
+      if ([400, 401, 403].includes(result.status)) {
+        return { ok: false, error: `API key rejected (${result.status}): ${result.message}` }
+      }
+      return { ok: true }
+    }
+
+    if (provider === 'meta') {
+      // Meta's /v1/models is auth-gated: a missing or bad key answers 401
+      // invalid_api_key, and nothing is billed.
+      const result = await checkMetaApiKey(key, metaBaseUrlFromEnv())
+      if (result.ok) return { ok: true }
+      if ([400, 401, 403].includes(result.status)) {
+        return { ok: false, error: `API key rejected (${result.status}): ${result.message}` }
+      }
+      return { ok: true }
+    }
+
     let url: string
     let headers: Record<string, string> = {}
     // Most providers can be probed with a plain GET /models. A few gate their
@@ -424,6 +468,8 @@ function reloadSavedApiKeyInRuntime(provider: APIProvider): void {
     provider === 'commandcode' ||
     provider === 'fireworks' ||
     provider === 'cloudflare' ||
+    provider === 'xai' ||
+    provider === 'meta' ||
     provider === 'minimax' ||
     provider === 'ollama'
   ) {
@@ -470,6 +516,7 @@ type FlowState =
   | { step: 'api_key_input'; error?: string }
   | { step: 'cloudflare_account_id_input'; error?: string }
   | { step: 'cloudflare_api_token_input'; accountId: string; error?: string }
+  | { step: 'xai_management_key_input'; warnings: string[]; error?: string }
   | { step: 'oauth_pending' }
   | { step: 'device_code'; userCode: string; verificationUri: string }
   | { step: 'antigravity_callback'; authUrl: string }
@@ -497,7 +544,7 @@ export function ProviderLoginFlow({ provider, onDone }: Props) {
       ]
     : isAntigravity
       ? [
-          { method: 'oauth_antigravity', label: 'Antigravity login (Gemini 3 Flash / 3.1 Pro high/low)' },
+          { method: 'oauth_antigravity', label: 'Antigravity login (Gemini 4 Argon / 3.8 Flash)' },
         ]
       : isKiro
         ? [
@@ -530,6 +577,8 @@ export function ProviderLoginFlow({ provider, onDone }: Props) {
   const [cloudflareAccountCursorOffset, setCloudflareAccountCursorOffset] = useState(0)
   const [apiKeyInput, setApiKeyInput] = useState('')
   const [apiKeyCursorOffset, setApiKeyCursorOffset] = useState(0)
+  const [managementKeyInput, setManagementKeyInput] = useState('')
+  const [managementKeyCursorOffset, setManagementKeyCursorOffset] = useState(0)
   const [callbackUrlInput, setCallbackUrlInput] = useState('')
   const [callbackUrlCursorOffset, setCallbackUrlCursorOffset] = useState(0)
   const [antigravityOAuth, setAntigravityOAuth] = useState<AntigravityOAuthHandles | null>(null)
@@ -735,6 +784,12 @@ export function ProviderLoginFlow({ provider, onDone }: Props) {
 
   useInput((input: string, key: { return?: boolean; escape?: boolean; upArrow?: boolean; downArrow?: boolean }) => {
     if (key.escape) {
+      // The xAI API key is already saved at this step; Esc only skips the
+      // optional management key.
+      if (state.step === 'xai_management_key_input') {
+        finishLogin(state.warnings)
+        return
+      }
       onDone(false)
       return
     }
@@ -814,16 +869,14 @@ export function ProviderLoginFlow({ provider, onDone }: Props) {
         process.env.COMMAND_CODE_API_KEY = key
       }
       reloadSavedApiKeyInRuntime(provider)
-      if (warnings.length > 0) {
-        setState({
-          step: 'error',
-          message: `Key saved. Warnings:\n  • ${warnings.join('\n  • ')}`,
-        })
-        setTimeout(() => onDone(true), 2000)
-      } else {
-        setState({ step: 'success' })
-        setTimeout(() => onDone(true), 800)
+      if (provider === 'xai') {
+        // Optional second credential: billing reads for /usage.
+        setManagementKeyInput('')
+        setManagementKeyCursorOffset(0)
+        setState({ step: 'xai_management_key_input', warnings })
+        return
       }
+      finishLogin(warnings)
     }
 
     const warnings: string[] = []
@@ -836,6 +889,45 @@ export function ProviderLoginFlow({ provider, onDone }: Props) {
         persistAndFinish(warnings)
       })
       .catch(() => persistAndFinish(warnings))
+  }
+
+  function finishLogin(warnings: string[]) {
+    if (warnings.length > 0) {
+      setState({
+        step: 'error',
+        message: `Key saved. Warnings:\n  • ${warnings.join('\n  • ')}`,
+      })
+      setTimeout(() => onDone(true), 2000)
+    } else {
+      setState({ step: 'success' })
+      setTimeout(() => onDone(true), 800)
+    }
+  }
+
+  function handleXaiManagementKeySubmit(value: string) {
+    if (state.step !== 'xai_management_key_input') return
+    const warnings = state.warnings
+    const managementKey = value.trim()
+    if (!managementKey) {
+      finishLogin(warnings)
+      return
+    }
+    setState({ step: 'validating' })
+    validateXaiManagementKey(managementKey)
+      .then((result) => {
+        if (!result.ok) {
+          setState({
+            step: 'xai_management_key_input',
+            warnings,
+            error: `Management key rejected: ${result.message}. Paste another, or press Enter to skip.`,
+          })
+          return
+        }
+        saveProviderKey('xai_management', managementKey)
+        process.env.XAI_MANAGEMENT_API_KEY = managementKey
+        finishLogin(warnings)
+      })
+      .catch(() => finishLogin(warnings))
   }
 
   function handleCloudflareAccountSubmit(value: string) {
@@ -1116,6 +1208,41 @@ export function ProviderLoginFlow({ provider, onDone }: Props) {
           </Box>
           <Box marginTop={1}>
             <Text dimColor>Enter to submit, Esc to cancel</Text>
+          </Box>
+        </Box>
+      )}
+
+      {state.step === 'xai_management_key_input' && (
+        <Box flexDirection="column">
+          <Text color="success">API key saved.</Text>
+          <Text dimColor>
+            Optional: a management key lets /usage show your prepaid balance, this month's spend and the spending limit.
+          </Text>
+          <Text dimColor>
+            Create one at <Text color="suggestion">https://console.x.ai</Text> → Settings → Management Keys.
+          </Text>
+          {state.error && (
+            <Box marginTop={1}>
+              <Text color="error">{state.error}</Text>
+            </Box>
+          )}
+          <Box marginTop={1}>
+            <Text>Management key: </Text>
+            <TextInput
+              value={managementKeyInput}
+              onChange={setManagementKeyInput}
+              onSubmit={handleXaiManagementKeySubmit}
+              mask="*"
+              placeholder="Paste a management key, or press Enter to skip..."
+              focus={true}
+              showCursor={true}
+              columns={inputColumns}
+              cursorOffset={managementKeyCursorOffset}
+              onChangeCursorOffset={setManagementKeyCursorOffset}
+            />
+          </Box>
+          <Box marginTop={1}>
+            <Text dimColor>Enter to submit or skip, Esc to skip</Text>
           </Box>
         </Box>
       )}

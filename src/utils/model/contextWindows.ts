@@ -19,6 +19,8 @@ import {
   persistProviderContextWindows,
 } from './contextWindowStore.js'
 import { getCommandCodeCatalogContextWindow } from './commandCodeCatalog.js'
+import { getXaiContextWindow } from './xaiCatalog.js'
+import { getMetaContextWindow } from './metaCatalog.js'
 
 type ContextWindowMap = Record<string, number>
 
@@ -198,6 +200,7 @@ const KNOWN_MODEL_CONTEXT_WINDOWS: ContextWindowMap = {
   'gpt-4': 8_192,
 
   // Google Gemini catalogs.
+  'gemini-4-argon': GEMINI_LONG_CONTEXT_WINDOW,
   'gemini-3.1-pro': GEMINI_LONG_CONTEXT_WINDOW,
   'gemini-3.1-pro-high': GEMINI_LONG_CONTEXT_WINDOW,
   'gemini-3.1-pro-low': GEMINI_LONG_CONTEXT_WINDOW,
@@ -260,6 +263,7 @@ const PREFIX_CONTEXT_WINDOWS: ContextWindowMap = {
   'gpt-5.1-codex-mini': 272_000,
   'gpt-5.1': 272_000,
   'gpt-5-mini': 272_000,
+  'gemini-4-argon': GEMINI_LONG_CONTEXT_WINDOW,
   'gemini-3.5-flash': GEMINI_LONG_CONTEXT_WINDOW,
   'gemini-3.1-pro': GEMINI_LONG_CONTEXT_WINDOW,
   'gemini-3.1-flash-lite': GEMINI_LONG_CONTEXT_WINDOW,
@@ -434,6 +438,20 @@ function lookupHostWindow(
 
   if (provider === 'mistral') {
     const window = getMistralModelMeta(model)?.contextWindow
+    if (window !== undefined) return window
+  }
+
+  // xAI states each row's window on /v1/models; the catalog keeps that
+  // listing and a docs snapshot, so a resumed session knows it before /models.
+  if (provider === 'xai') {
+    const window = getXaiContextWindow(model)
+    if (window !== undefined) return window
+  }
+
+  // Meta's /v1/models states ids only; its catalog (models.dev, then a docs
+  // snapshot) knows each window, so a resumed session knows it before /models.
+  if (provider === 'meta') {
+    const window = getMetaContextWindow(model)
     if (window !== undefined) return window
   }
 

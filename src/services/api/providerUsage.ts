@@ -67,6 +67,16 @@ import {
   recordAlibabaLiveModels,
 } from '../../utils/model/alibabaCatalog.js'
 import type { ProviderWithUsageReporter } from './providerUsageCoverage.js'
+import {
+  checkXaiApiKey,
+  fetchXaiBilling,
+  getXaiManagementKey,
+  xaiKeyBlockReason,
+} from './xaiAccount.js'
+import { getXaiSessionSpend } from '../../lanes/openai-compat/xai_responses.js'
+import { checkMetaApiKey, META_BILLING_URL, META_USAGE_URL } from './metaAccount.js'
+import { getMetaSessionSpend } from '../../lanes/openai-compat/meta_responses.js'
+import { getProviderRateLimits } from './providerRateLimits.js'
 
 const TIMEOUT_MS = 8_000
 const CLINE_OAUTH_STORAGE = 'cline_oauth'
@@ -84,6 +94,8 @@ const DOCS = {
   lxd: 'https://api.lxds.org/instructions',
   mimo: 'https://xiaomimimo.com',
   alibaba: 'https://www.alibabacloud.com/help/en/model-studio/billing-for-model-studio',
+  xai: 'https://docs.x.ai/developers/rest-api-reference/management/billing',
+  meta: 'https://dev.meta.ai/docs/pricing-rate-limits',
   moonshot: 'https://platform.kimi.ai/docs/api/balance',
   minimax: 'https://platform.minimax.io/docs/token-plan/faq',
   cursor: 'https://docs.cursor.com/en/account/teams/admin-api',
@@ -208,6 +220,8 @@ const REPORTERS_BY_PROVIDER: Record<ProviderWithUsageReporter, Reporter> = {
   lxd: reportLXD,
   mimo: reportMimo,
   alibaba: reportAlibaba,
+  xai: reportXai,
+  meta: reportMeta,
   moonshot: reportMoonshot,
   minimax: reportMiniMax,
   ollama: reportOllama,
@@ -286,6 +300,8 @@ function nameToProvider(name: string): ProviderUsageId {
     case 'lxd': return 'lxd'
     case 'mimo': return 'mimo'
     case 'alibaba': return 'alibaba'
+    case 'xai': return 'xai'
+    case 'meta': return 'meta'
     case 'glm': return 'glm'
     case 'moonshot': return 'moonshot'
     case 'minimax': return 'minimax'
@@ -1604,6 +1620,196 @@ async function reportMimo(): Promise<ProviderUsageReport> {
       + 'visible in the MiMo console. Token Plan subscribers can point '
       + 'MIMO_BASE_URL at token-plan-sgp (or token-plan-cn) .xiaomimimo.com/v1.',
     docsUrl: DOCS.mimo,
+    links,
+  }
+}
+
+function formatUsdPrecise(value: number): string {
+  return value > 0 && value < 0.01 ? `$${value.toFixed(4)}` : formatCurrency(value, 'USD')
+}
+
+/**
+ * xAI. The API key can describe itself (GET /v1/api-key: name, team, blocked
+ * or disabled) but cannot read money. A management key — optional, added in
+ * /login xai or as XAI_MANAGEMENT_API_KEY — reads the team's prepaid balance,
+ * the postpaid invoice against its spending limit, and this month's spend per
+ * model. Every response also carries the exact cost of that request, summed
+ * here as what xAI billed this session.
+ */
+async function reportXai(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('xai')
+  const links: UsageLink[] = [
+    { label: 'xAI console usage', url: 'https://console.x.ai/team/default/usage' },
+    { label: 'xAI billing', url: 'https://console.x.ai/team/default/billing' },
+  ]
+  if (!apiKey) {
+    return {
+      ...baseReport('xai', 'not_configured', 'none', 'xAI API key', 'No xAI API key is configured. Run /login xai.'),
+      docsUrl: DOCS.xai,
+      links,
+    }
+  }
+
+  const check = await checkXaiApiKey(apiKey, getProviderBaseUrl('xai'))
+  if (!check.ok) {
+    return {
+      ...baseReport('xai', 'error', 'api_key', 'xAI API key', `xAI rejected the API key (${check.status}): ${check.message}`),
+      docsUrl: DOCS.xai,
+      links,
+    }
+  }
+
+  const info = check.info
+  const blocked = xaiKeyBlockReason(info)
+  const details: string[] = []
+  const keyLabel = [info.name, info.redactedKey].filter(Boolean).join(' · ')
+  if (keyLabel) details.push(`Key: ${keyLabel}`)
+  const session = getXaiSessionSpend()
+  if (session.requests > 0) {
+    details.push(`This session: ${formatUsdPrecise(session.usd)} billed by xAI over ${session.requests} request${session.requests === 1 ? '' : 's'}.`)
+  }
+
+  const managementKey = getXaiManagementKey()
+  if (!managementKey || !info.teamId) {
+    details.push('Add a management key (/login xai, or XAI_MANAGEMENT_API_KEY) to see the prepaid balance, this month\'s spend and the spending limit.')
+    return {
+      ...baseReport(
+        'xai',
+        blocked ? 'error' : 'connected',
+        'api_key',
+        'xAI API key',
+        blocked ? `The API key authenticates, but ${blocked}.` : 'API key active.',
+      ),
+      detail: details.join('\n'),
+      docsUrl: DOCS.xai,
+      links,
+    }
+  }
+
+  const billing = await fetchXaiBilling(managementKey, info.teamId)
+  const metrics: UsageMetric[] = []
+  const summary: string[] = []
+  if (billing.prepaidRemaining !== undefined) {
+    const remaining = `${formatCurrency(billing.prepaidRemaining, 'USD')} remaining`
+    metrics.push({ label: 'Prepaid credits', remaining, summary: remaining })
+    summary.push(`${formatCurrency(billing.prepaidRemaining, 'USD')} prepaid`)
+  }
+  const invoice = billing.invoice
+  if (invoice?.amountDue !== undefined) {
+    const limit = invoice.spendingLimit
+    metrics.push({
+      label: 'Postpaid this cycle',
+      usedPercent: limit ? clampPercent(invoice.amountDue / limit * 100) : undefined,
+      summary: limit
+        ? `${formatCurrency(invoice.amountDue, 'USD')} / ${formatCurrency(limit, 'USD')} spending limit`
+        : `${formatCurrency(invoice.amountDue, 'USD')} due`,
+    })
+  }
+  if (billing.monthToDate) {
+    const total = billing.monthToDate.reduce((sum, line) => sum + line.usd, 0)
+    metrics.push({
+      label: 'This month',
+      summary: `${formatUsdPrecise(total)} spent`,
+      ...(billing.monthToDate.length > 0 && {
+        detail: billing.monthToDate.slice(0, 4).map(line => `${line.label}: ${formatUsdPrecise(line.usd)}`).join(', '),
+      }),
+    })
+    summary.push(`${formatUsdPrecise(total)} spent this month`)
+  }
+  if (billing.errors.length > 0) details.push(`Not read: ${billing.errors.join('; ')}`)
+
+  return {
+    ...baseReport(
+      'xai',
+      blocked ? 'error' : metrics.length > 0 ? 'ok' : 'connected',
+      'admin_api_key',
+      'xAI billing (management key)',
+      blocked
+        ? `The API key authenticates, but ${blocked}.`
+        : summary.length > 0 ? `${summary.join(', ')}.` : 'API key active; billing returned nothing.',
+    ),
+    ...(details.length > 0 && { detail: details.join('\n') }),
+    ...(metrics.length > 0 && { metrics }),
+    docsUrl: DOCS.xai,
+    links,
+  }
+}
+
+/**
+ * Meta Model API. Meta documents no endpoint for a balance or for spend: the
+ * dashboard's Usage and Billing pages are the only place either is shown.
+ * What an API key can prove is that it authenticates (`GET /v1/models`
+ * answers 401 otherwise). Every response states its tokens, so this
+ * session's spend is priced here from Meta's published rates, and the team's
+ * rate-limit headroom comes from the last Meta response's `x-ratelimit-*`
+ * headers.
+ */
+async function reportMeta(): Promise<ProviderUsageReport> {
+  const apiKey = getProviderApiKey('meta')
+  const links: UsageLink[] = [
+    { label: 'Meta usage', url: META_USAGE_URL },
+    { label: 'Meta billing', url: META_BILLING_URL },
+  ]
+  if (!apiKey) {
+    return {
+      ...baseReport('meta', 'not_configured', 'none', 'Meta API key', 'No Meta API key is configured. Run /login meta.'),
+      docsUrl: DOCS.meta,
+      links,
+    }
+  }
+
+  const check = await checkMetaApiKey(apiKey, getProviderBaseUrl('meta'))
+  if (!check.ok) {
+    const summary = check.status === 401 || check.status === 403
+      ? `Meta rejected the API key (${check.status}): ${check.message}`
+      : check.status === 0
+        ? `Could not reach Meta: ${check.message}`
+        : `Meta's key check failed (${check.status}): ${check.message}`
+    return {
+      ...baseReport('meta', 'error', 'api_key', 'Meta API key', summary),
+      docsUrl: DOCS.meta,
+      links,
+    }
+  }
+
+  const details: string[] = []
+  const session = getMetaSessionSpend()
+  if (session.requests > 0) {
+    const unpriced = session.unpricedRequests > 0
+      ? ` (${session.unpricedRequests} on a model with no published price)`
+      : ''
+    details.push(
+      `This session: ${formatUsdPrecise(session.usd)} over ${session.requests} request${session.requests === 1 ? '' : 's'}, priced from Meta's published rates${unpriced}.`,
+    )
+  }
+  details.push('Meta publishes no balance or spend API; the Usage and Billing pages show both.')
+
+  const metrics: UsageMetric[] = []
+  const limits = getProviderRateLimits()
+  if (limits?.provider === 'meta') {
+    const windows = [['Rate limit: requests', limits.requests], ['Rate limit: tokens', limits.tokens]] as const
+    for (const [label, window] of windows) {
+      if (!window || window.limit === undefined || window.remaining === undefined || window.limit <= 0) continue
+      metrics.push({
+        label,
+        usedPercent: clampPercent((window.limit - window.remaining) / window.limit * 100),
+        summary: `${window.remaining.toLocaleString('en-US')} of ${window.limit.toLocaleString('en-US')} left`,
+      })
+    }
+  }
+
+  const models = check.modelIds.length
+  return {
+    ...baseReport(
+      'meta',
+      metrics.length > 0 ? 'ok' : 'connected',
+      'api_key',
+      'Meta API key',
+      `API key active${models > 0 ? `, ${models} model${models === 1 ? '' : 's'} available` : ''}.`,
+    ),
+    detail: details.join('\n'),
+    ...(metrics.length > 0 && { metrics }),
+    docsUrl: DOCS.meta,
     links,
   }
 }

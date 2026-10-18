@@ -1,4 +1,6 @@
 import { decodeToolArguments, toolDecodeFields } from '../services/mcp/decodeStatus.js'
+import { getStreamDisplayText, hasMessageDisplayText } from './hooks/messageDisplay.js'
+import { isPlainStdoutContextEvent } from './hooks/hookPolicy.js'
 import { getAPIProvider, type APIProvider } from './model/providers.js'
 import { normalizeModelStringForAPI } from './model/model.js'
 import { resolveEffectiveAPIProvider } from '../services/api/providerRouting.js'
@@ -2017,8 +2019,11 @@ export function normalizeMessagesForAPI(
   options: { provider?: APIProvider; model?: string } = {},
 ): (UserMessage | AssistantMessage)[] {
   const preserveOpenRouterReasoning = getAPIProvider() === 'openrouter'
+  // The Codex lane and the xAI and Meta Responses routes replay encrypted
+  // reasoning from this state, each only to the model that produced it.
+  const reasoningProvider = options.provider ?? resolveEffectiveAPIProvider(getAPIProvider(), options.model)
   const preserveCodexReasoning =
-    (options.provider ?? resolveEffectiveAPIProvider(getAPIProvider(), options.model)) === 'openai'
+    reasoningProvider === 'openai' || reasoningProvider === 'xai' || reasoningProvider === 'meta'
   // Compare the same model identity sent to the provider, without UI context tags.
   const codexModel = options.model ? normalizeModelStringForAPI(options.model) : undefined
   const invalidCodexReasoningMessages = new Set<Message>()
@@ -3025,6 +3030,7 @@ export function handleMessageFromStream(
   ) => void,
   onApiMetrics?: (metrics: { ttftMs: number }) => void,
   onStreamingText?: (f: (current: string | null) => string | null) => void,
+  onStreamingDisplayText?: (f: (current: string | null) => string | null, filtered?: boolean) => void,
 ): void {
   if (
     message.type !== 'stream_event' &&
@@ -3071,6 +3077,7 @@ export function handleMessageFromStream(
     // from deferredMessages to messages in the same batch, making the
     // transition from streaming text → final message atomic (no gap, no duplication).
     onStreamingText?.(() => null)
+    onStreamingDisplayText?.(() => null)
     onMessage(message)
     return
   }
@@ -3095,6 +3102,7 @@ export function handleMessageFromStream(
   switch (message.event.type) {
     case 'content_block_start':
       onStreamingText?.(() => null)
+      onStreamingDisplayText?.(() => null)
       if (
         feature('CONNECTOR_TEXT') &&
         isConnectorTextBlock(message.event.content_block)
@@ -3117,6 +3125,11 @@ export function handleMessageFromStream(
           return
         case 'text':
           onSetStreamMode('responding')
+          if (message.event.content_block.text) {
+            const block = message.event.content_block
+            onStreamingText?.(() => block.text)
+            onStreamingDisplayText?.(() => getStreamDisplayText(block), hasMessageDisplayText(block))
+          }
           return
         case 'tool_use': {
           onSetStreamMode('tool-input')
@@ -3153,6 +3166,7 @@ export function handleMessageFromStream(
           const deltaText = message.event.delta.text
           onUpdateLength(deltaText)
           onStreamingText?.(text => (text ?? '') + deltaText)
+          onStreamingDisplayText?.(text => (text ?? '') + getStreamDisplayText(message.event.delta), hasMessageDisplayText(message.event.delta))
           return
         }
         case 'input_json_delta': {
@@ -4241,10 +4255,7 @@ You have exited auto mode. The user may now want to interact more directly. You 
         }),
       ]
     case 'hook_success':
-      if (
-        attachment.hookEvent !== 'SessionStart' &&
-        attachment.hookEvent !== 'UserPromptSubmit'
-      ) {
+      if (!isPlainStdoutContextEvent(attachment.hookEvent)) {
         return []
       }
       if (attachment.content === '') {
