@@ -3,6 +3,10 @@
 All notable changes to **Tau**, from the first release to the latest.
 Each version lists what was fixed or added, newest first.
 
+## v0.92.43 (2026-10-18)
+
+- Add user-defined custom providers: declare any OpenAI Chat Completions or Anthropic Messages endpoint under `customProviders` in settings.json, then manage it end-to-end with `/provider` (add via a wizard, edit, activate, remove) and browse its live `<baseUrl>/v1/models` catalog in `/models` and `/model`. Custom provider base URLs are read only from trusted settings sources; API keys resolve from `<ID>_API_KEY` or the stored key, with an optional `<ID>_BASE_URL` override that applies to both listing and chat.
+
 ## v0.92.42 (2026-10-14)
 
 - Add Gemini 4 Argon on Antigravity, keep older models available to saved sessions, and use Gemini 3.8 Flash Low for automatic Gemini subagents (1761101b)
