@@ -674,13 +674,14 @@ function ProviderManager({
   function enterEditCustom(id: string) {
     const existing = getCustomProvider(id)
     if (!existing) return
-    setCustomFieldInput('')
-    setCustomFieldCursorOffset(0)
+    // Edit starts at the name field (id is immutable), pre-filled so the user
+    // only retypes the field they actually want to change.
+    setCustomFieldInput(existing.name)
+    setCustomFieldCursorOffset(existing.name.length)
     setView({
       kind: 'custom_form',
       mode: 'edit',
       id,
-      // Edit starts at the name field (id is immutable).
       steps: customFormSteps('edit'),
       step: 0,
       protocolCursor: existing.protocol === 'anthropic' ? 1 : 0,
@@ -776,6 +777,28 @@ function ProviderManager({
     return form.steps[form.step]
   }
 
+  /**
+   * The value to pre-fill into a step's input on edit. On add, steps start
+   * empty; on edit, the existing value is shown so the user can adjust a
+   * single field and press Enter through the rest without retyping.
+   */
+  function customStepPrefill(
+    form: Extract<View, { kind: 'custom_form' }>,
+    step: CustomFormStep | undefined,
+  ): string {
+    if (form.mode !== 'edit') return ''
+    switch (step) {
+      case 'name':
+        return form.draft.name
+      case 'baseUrl':
+        return form.draft.baseUrl
+      case 'apiKey':
+        return form.draft.apiKey
+      default:
+        return ''
+    }
+  }
+
   function validateCustomField(
     form: Extract<View, { kind: 'custom_form' }>,
     raw: string,
@@ -833,8 +856,11 @@ function ProviderManager({
       finishCustomForm(form, draft)
       return
     }
-    setCustomFieldInput('')
-    setCustomFieldCursorOffset(0)
+    const nextStep = form.steps[form.step + 1]
+    // Pre-fill the next step on edit so unchanged fields just need Enter.
+    const prefill = customStepPrefill({ ...form, draft }, nextStep)
+    setCustomFieldInput(prefill)
+    setCustomFieldCursorOffset(prefill.length)
     setView({ ...form, step: form.step + 1, draft, error: undefined })
   }
 
@@ -1583,6 +1609,13 @@ function ProviderManager({
       },
     }
 
+    // On edit the field is pre-filled; Enter keeps it, so only the fields the
+    // user wants to change need editing.
+    const editHint =
+      !isAdd && step !== 'protocol' && step !== 'apiKey'
+        ? 'Editing a copy of the current value — Enter keeps it, or change it.'
+        : undefined
+
     // Fields already collected, shown for context.
     const collected: Array<[string, string]> = []
     if (isAdd && view.draft.id) collected.push(['id', view.draft.id])
@@ -1653,6 +1686,7 @@ function ProviderManager({
               />
             </Box>
             {stepMeta[step].hint && <Text dimColor>{stepMeta[step].hint}</Text>}
+            {editHint && <Text dimColor>{editHint}</Text>}
             <Box marginTop={1}>
               <Text dimColor>Enter to continue · Esc to cancel</Text>
             </Box>
